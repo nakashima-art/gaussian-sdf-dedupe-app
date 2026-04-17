@@ -22,7 +22,7 @@ st.title("Gaussian SDF Dedupe App")
 st.caption("Ver. 1.0")
 st.write("Convert Gaussian .log files to SDF, merge conformers, and filter structures by RMSD.")
 st.info(
-    "Use symmetry-aware RMSD for symmetric structures such as para-substituted benzenes. "
+    "Use symmetry-aware RMSD for molecules containing internally symmetric substructures (e.g., para-substituted aryl groups). "
     "For ordinary asymmetric structures, direct alignment RMSD can be used."
 )
 
