@@ -26,6 +26,13 @@ st.info(
     "For ordinary asymmetric structures, direct alignment RMSD can be used."
 )
 
+# session state initialization
+if "results_ready" not in st.session_state:
+    st.session_state.results_ready = False
+
+if "result_payload" not in st.session_state:
+    st.session_state.result_payload = None
+
 
 # =========================
 # Regex / constants
@@ -288,6 +295,48 @@ def make_summary_csv_bytes(summary_rows):
     return df, csv_text.encode("utf-8")
 
 
+def render_results(payload):
+    st.subheader("Results")
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Uploaded log files", payload["uploaded_count"])
+    col2.metric("Valid conformers", payload["valid_count"])
+    col3.metric("Structures kept", payload["kept_count"])
+
+    st.subheader("Summary table")
+    st.dataframe(payload["display_df"], use_container_width=True)
+
+    st.subheader("Download outputs")
+    d1, d2, d3 = st.columns(3)
+
+    d1.download_button(
+        label="Download all_conformers.sdf",
+        data=payload["all_sdf_bytes"],
+        file_name="all_conformers.sdf",
+        mime="chemical/x-mdl-sdfile"
+    )
+
+    d2.download_button(
+        label="Download unique_conformers.sdf",
+        data=payload["unique_sdf_bytes"],
+        file_name="unique_conformers.sdf",
+        mime="chemical/x-mdl-sdfile"
+    )
+
+    d3.download_button(
+        label="Download summary.csv",
+        data=payload["summary_csv_bytes"],
+        file_name="summary.csv",
+        mime="text/csv"
+    )
+
+    with st.expander("Show conversion details"):
+        if payload["conversion_logs_df"] is not None and not payload["conversion_logs_df"].empty:
+            st.dataframe(payload["conversion_logs_df"], use_container_width=True)
+        else:
+            st.write("No conversion issues were recorded.")
+
+
 # =========================
 # Sidebar settings
 # =========================
@@ -337,6 +386,11 @@ with st.sidebar:
         "Use heavy-atom RMSD (remove H atoms for RMSD calculation)",
         value=True
     )
+
+    if st.button("Clear results"):
+        st.session_state.results_ready = False
+        st.session_state.result_payload = None
+        st.rerun()
 
 
 # =========================
@@ -505,42 +559,20 @@ if run_button:
             na_position="last"
         ).reset_index(drop=True)
 
-        st.subheader("Results")
+        conversion_logs_df = pd.DataFrame(conversion_logs) if conversion_logs else pd.DataFrame()
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Uploaded log files", len(uploaded_files))
-        col2.metric("Valid conformers", len(mols))
-        col3.metric("Structures kept", len(kept_mols))
+        st.session_state.result_payload = {
+            "uploaded_count": len(uploaded_files),
+            "valid_count": len(mols),
+            "kept_count": len(kept_mols),
+            "display_df": display_df,
+            "all_sdf_bytes": all_sdf_bytes,
+            "unique_sdf_bytes": unique_sdf_bytes,
+            "summary_csv_bytes": summary_csv_bytes,
+            "conversion_logs_df": conversion_logs_df,
+        }
+        st.session_state.results_ready = True
 
-        st.subheader("Summary table")
-        st.dataframe(display_df, use_container_width=True)
-
-        st.subheader("Download outputs")
-        d1, d2, d3 = st.columns(3)
-
-        d1.download_button(
-            label="Download all_conformers.sdf",
-            data=all_sdf_bytes,
-            file_name="all_conformers.sdf",
-            mime="chemical/x-mdl-sdfile"
-        )
-
-        d2.download_button(
-            label="Download unique_conformers.sdf",
-            data=unique_sdf_bytes,
-            file_name="unique_conformers.sdf",
-            mime="chemical/x-mdl-sdfile"
-        )
-
-        d3.download_button(
-            label="Download summary.csv",
-            data=summary_csv_bytes,
-            file_name="summary.csv",
-            mime="text/csv"
-        )
-
-        with st.expander("Show conversion details"):
-            if conversion_logs:
-                st.dataframe(pd.DataFrame(conversion_logs), use_container_width=True)
-            else:
-                st.write("No conversion issues were recorded.")
+# render from session state
+if st.session_state.results_ready and st.session_state.result_payload is not None:
+    render_results(st.session_state.result_payload)
