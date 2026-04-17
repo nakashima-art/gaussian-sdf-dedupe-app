@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import tempfile
 import subprocess
-import shutil
 import re
 import io
 from pathlib import Path
@@ -27,6 +26,7 @@ st.caption("Convert Gaussian .log files to SDF, merge conformers, and remove dup
 # Regex / constants
 # =========================
 SCF_RE = re.compile(r"SCF Done:\s+E\([RU]?\w+\)\s+=\s+(-?\d+\.\d+)")
+ARCHIVE_HF_RE = re.compile(r"\|HF=(-?\d+\.\d+)")
 GIBBS_KEY = "Sum of electronic and thermal Free Energies"
 NORMAL_TERM_KEY = "Normal termination of Gaussian"
 ENERGY_HARTREE_TO_KCAL = 627.509474
@@ -36,7 +36,6 @@ ENERGY_HARTREE_TO_KCAL = 627.509474
 # Helper functions
 # =========================
 def check_obabel_available():
-    """Return (ok, message)."""
     try:
         result = subprocess.run(
             ["obabel", "-H"],
@@ -59,12 +58,20 @@ def save_uploaded_file(uploaded_file, output_path: Path):
 
 def extract_last_scf_energy(logfile: Path):
     last = None
+    archive_last = None
+
     with open(logfile, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             m = SCF_RE.search(line)
             if m:
                 last = float(m.group(1))
-    return last
+
+            for m2 in ARCHIVE_HF_RE.finditer(line):
+                archive_last = float(m2.group(1))
+
+    if last is not None:
+        return last
+    return archive_last
 
 
 def extract_gibbs_energy(logfile: Path):
@@ -89,10 +96,6 @@ def check_normal_termination(logfile: Path):
 
 
 def convert_log_to_sdf(log_path: Path, sdf_path: Path):
-    """
-    Convert Gaussian log to SDF using Open Babel.
-    Returns (success, stdout, stderr).
-    """
     try:
         result = subprocess.run(
             ["obabel", str(log_path), "-O", str(sdf_path)],
@@ -106,6 +109,17 @@ def convert_log_to_sdf(log_path: Path, sdf_path: Path):
         return False, "", str(e)
 
 
+def read_first_mol_from_sdf(sdf_path: Path):
+    try:
+        suppl = Chem.SDMolSupplier(str(sdf_path), removeHs=False)
+        mols = [m for m in suppl if m is not None]
+        if not mols:
+            return None
+        return mols[0]
+    except Exception:
+        return None
+
+
 def set_energy_property_to_sdf(
     sdf_path: Path,
     source_name: str,
@@ -113,11 +127,7 @@ def set_energy_property_to_sdf(
     energy_type: str,
     normal_termination: bool
 ):
-    """
-    Read SDF with RDKit, add properties, and overwrite the SDF.
-    Returns (success, message).
-    """
-    mol = Chem.MolFromMolFile(str(sdf_path), removeHs=False)
+    mol = read_first_mol_from_sdf(sdf_path)
     if mol is None:
         return False, "RDKit failed to read the generated SDF."
 
@@ -136,7 +146,7 @@ def load_molecules_from_sdfs(sdf_paths):
     mols = []
     failed = []
     for sdf_path in sdf_paths:
-        mol = Chem.MolFromMolFile(str(sdf_path), removeHs=False)
+        mol = read_first_mol_from_sdf(sdf_path)
         if mol is None:
             failed.append(str(sdf_path.name))
         else:
@@ -154,9 +164,6 @@ def get_energy(mol, energy_type):
 
 
 def write_sdf_bytes(mols):
-    """
-    Write list of RDKit mols to in-memory SDF bytes.
-    """
     sio = io.StringIO()
     writer = Chem.SDWriter(sio)
     for mol in mols:
@@ -167,12 +174,6 @@ def write_sdf_bytes(mols):
 
 
 def deduplicate_molecules(mols, energy_type="SCF", rmsd_cutoff=0.20, remove_hs_for_rmsd=True):
-    """
-    Sort by energy, keep the lowest-energy representative among duplicates.
-    Returns:
-        kept_mols,
-        summary_rows
-    """
     prepared = []
     for idx, mol in enumerate(mols):
         energy = get_energy(mol, energy_type)
@@ -194,7 +195,6 @@ def deduplicate_molecules(mols, energy_type="SCF", rmsd_cutoff=0.20, remove_hs_f
     kept_info = []
     summary_rows = []
 
-    # Deduplicate valid-energy molecules
     for rank, item in enumerate(valid, start=1):
         mol = item["mol"]
         mol_r = Chem.RemoveHs(mol) if remove_hs_for_rmsd else mol
@@ -203,7 +203,7 @@ def deduplicate_molecules(mols, energy_type="SCF", rmsd_cutoff=0.20, remove_hs_f
         duplicate_of = ""
         best_rmsd = None
 
-        for kept_idx, kept_item in enumerate(kept_info, start=1):
+        for kept_item in kept_info:
             kept_mol = kept_item["mol"]
             kept_mol_r = Chem.RemoveHs(kept_mol) if remove_hs_for_rmsd else kept_mol
 
@@ -226,7 +226,7 @@ def deduplicate_molecules(mols, energy_type="SCF", rmsd_cutoff=0.20, remove_hs_f
             "source_file": item["source"],
             "energy_type": energy_type,
             "energy_hartree": item["energy"],
-            "relative_energy_kcal_mol": None,  # filled later
+            "relative_energy_kcal_mol": None,
             "rank_by_energy": rank,
             "status": "removed_as_duplicate" if is_dup else "kept",
             "duplicate_of": duplicate_of,
@@ -234,7 +234,6 @@ def deduplicate_molecules(mols, energy_type="SCF", rmsd_cutoff=0.20, remove_hs_f
             "normal_termination": item["normal_termination"],
         })
 
-    # Add invalid-energy molecules to summary
     for item in invalid:
         summary_rows.append({
             "source_file": item["source"],
@@ -242,16 +241,15 @@ def deduplicate_molecules(mols, energy_type="SCF", rmsd_cutoff=0.20, remove_hs_f
             "energy_hartree": None,
             "relative_energy_kcal_mol": None,
             "rank_by_energy": None,
-            "status": "energy_not_found",
+            "status": "energy_not_found_after_sdf_read",
             "duplicate_of": "",
             "rmsd_to_representative": None,
             "normal_termination": item["normal_termination"],
         })
 
-    # Fill relative energies
-    kept_energies = [row["energy_hartree"] for row in summary_rows if row["energy_hartree"] is not None]
-    if kept_energies:
-        e0 = min(kept_energies)
+    valid_energies = [row["energy_hartree"] for row in summary_rows if row["energy_hartree"] is not None]
+    if valid_energies:
+        e0 = min(valid_energies)
         for row in summary_rows:
             if row["energy_hartree"] is not None:
                 row["relative_energy_kcal_mol"] = (row["energy_hartree"] - e0) * ENERGY_HARTREE_TO_KCAL
@@ -371,7 +369,7 @@ if run_button:
                 continue
 
             if energy_value is None:
-                record["status"] = "energy_not_found"
+                record["status"] = "energy_not_found_in_log"
                 conversion_logs.append(record)
                 progress.progress(i / total_files)
                 continue
@@ -403,7 +401,6 @@ if run_button:
                 st.dataframe(pd.DataFrame(conversion_logs), use_container_width=True)
             st.stop()
 
-        # Load molecules from all successful SDFs
         mols, sdf_read_failed = load_molecules_from_sdfs(sdf_paths)
 
         if not mols:
@@ -413,10 +410,8 @@ if run_button:
                 st.dataframe(pd.DataFrame(conversion_logs), use_container_width=True)
             st.stop()
 
-        # Create all_conformers.sdf
         all_sdf_bytes = write_sdf_bytes(mols)
 
-        # Deduplicate
         kept_mols, dedupe_summary_rows = deduplicate_molecules(
             mols=mols,
             energy_type=energy_type,
@@ -426,13 +421,10 @@ if run_button:
 
         unique_sdf_bytes = write_sdf_bytes(kept_mols)
 
-        # Merge summary information
-        # First, table from dedupe step
         summary_rows = dedupe_summary_rows[:]
 
-        # Add conversion failures
         for row in conversion_logs:
-            if row["status"] in {"conversion_failed", "energy_not_found", "sdf_property_write_failed"}:
+            if row["status"] in {"conversion_failed", "energy_not_found_in_log", "sdf_property_write_failed"}:
                 summary_rows.append({
                     "source_file": row["source_file"],
                     "energy_type": row["energy_type"],
@@ -445,7 +437,6 @@ if run_button:
                     "normal_termination": row["normal_termination"],
                 })
 
-        # Add SDF read failures if any
         for name in sdf_read_failed:
             summary_rows.append({
                 "source_file": name,
@@ -461,15 +452,11 @@ if run_button:
 
         summary_df, summary_csv_bytes = make_summary_csv_bytes(summary_rows)
 
-        # Sort summary for display
         display_df = summary_df.sort_values(
             by=["status", "rank_by_energy", "source_file"],
             na_position="last"
         ).reset_index(drop=True)
 
-        # =========================
-        # Results
-        # =========================
         st.subheader("Results")
 
         col1, col2, col3 = st.columns(3)
