@@ -19,7 +19,7 @@ st.set_page_config(
 )
 
 st.title("Gaussian SDF Dedupe App")
-st.caption("Convert Gaussian .log files to SDF, merge conformers, and remove duplicates by RMSD.")
+st.caption("Convert Gaussian .log files to SDF, merge conformers, and filter structures by RMSD.")
 
 
 # =========================
@@ -120,6 +120,17 @@ def read_first_mol_from_sdf(sdf_path: Path):
         return None
 
 
+def read_all_mols_from_sdf_bytes(sdf_bytes):
+    try:
+        text = sdf_bytes.decode("utf-8", errors="ignore")
+        suppl = Chem.SDMolSupplier()
+        suppl.SetData(text, removeHs=False)
+        mols = [m for m in suppl if m is not None]
+        return mols
+    except Exception:
+        return []
+
+
 def set_energy_property_to_sdf(
     sdf_path: Path,
     source_name: str,
@@ -173,7 +184,27 @@ def write_sdf_bytes(mols):
     return text.encode("utf-8")
 
 
-def deduplicate_molecules(mols, energy_type="SCF", rmsd_cutoff=0.20, remove_hs_for_rmsd=True):
+def calculate_rmsd(mol_a, mol_b, method="GetBestRMS", remove_hs_for_rmsd=True):
+    try:
+        a = Chem.RemoveHs(mol_a) if remove_hs_for_rmsd else mol_a
+        b = Chem.RemoveHs(mol_b) if remove_hs_for_rmsd else mol_b
+
+        if method == "AlignMol":
+            rmsd = AllChem.AlignMol(a, b)
+        else:
+            rmsd = AllChem.GetBestRMS(a, b)
+        return rmsd
+    except Exception:
+        return None
+
+
+def deduplicate_molecules(
+    mols,
+    energy_type="SCF",
+    rmsd_cutoff=0.20,
+    remove_hs_for_rmsd=True,
+    rmsd_method="GetBestRMS"
+):
     prepared = []
     for idx, mol in enumerate(mols):
         energy = get_energy(mol, energy_type)
@@ -197,7 +228,6 @@ def deduplicate_molecules(mols, energy_type="SCF", rmsd_cutoff=0.20, remove_hs_f
 
     for rank, item in enumerate(valid, start=1):
         mol = item["mol"]
-        mol_r = Chem.RemoveHs(mol) if remove_hs_for_rmsd else mol
 
         is_dup = False
         duplicate_of = ""
@@ -205,12 +235,13 @@ def deduplicate_molecules(mols, energy_type="SCF", rmsd_cutoff=0.20, remove_hs_f
 
         for kept_item in kept_info:
             kept_mol = kept_item["mol"]
-            kept_mol_r = Chem.RemoveHs(kept_mol) if remove_hs_for_rmsd else kept_mol
 
-            try:
-                rmsd = AllChem.GetBestRMS(mol_r, kept_mol_r)
-            except Exception:
-                rmsd = None
+            rmsd = calculate_rmsd(
+                mol,
+                kept_mol,
+                method=rmsd_method,
+                remove_hs_for_rmsd=remove_hs_for_rmsd
+            )
 
             if rmsd is not None and rmsd < rmsd_cutoff:
                 is_dup = True
@@ -231,6 +262,7 @@ def deduplicate_molecules(mols, energy_type="SCF", rmsd_cutoff=0.20, remove_hs_f
             "status": "removed_as_duplicate" if is_dup else "kept",
             "duplicate_of": duplicate_of,
             "rmsd_to_representative": best_rmsd,
+            "rmsd_to_reference": None,
             "normal_termination": item["normal_termination"],
         })
 
@@ -244,6 +276,85 @@ def deduplicate_molecules(mols, energy_type="SCF", rmsd_cutoff=0.20, remove_hs_f
             "status": "energy_not_found_after_sdf_read",
             "duplicate_of": "",
             "rmsd_to_representative": None,
+            "rmsd_to_reference": None,
+            "normal_termination": item["normal_termination"],
+        })
+
+    valid_energies = [row["energy_hartree"] for row in summary_rows if row["energy_hartree"] is not None]
+    if valid_energies:
+        e0 = min(valid_energies)
+        for row in summary_rows:
+            if row["energy_hartree"] is not None:
+                row["relative_energy_kcal_mol"] = (row["energy_hartree"] - e0) * ENERGY_HARTREE_TO_KCAL
+
+    return kept, summary_rows
+
+
+def filter_against_reference(
+    mols,
+    reference_mol,
+    energy_type="SCF",
+    rmsd_cutoff=0.20,
+    remove_hs_for_rmsd=True,
+    rmsd_method="GetBestRMS"
+):
+    prepared = []
+    for idx, mol in enumerate(mols):
+        energy = get_energy(mol, energy_type)
+        source = mol.GetProp("SourceFile") if mol.HasProp("SourceFile") else f"mol_{idx+1}"
+        normal_term = mol.GetProp("NormalTermination") if mol.HasProp("NormalTermination") else ""
+        prepared.append({
+            "mol": mol,
+            "energy": energy,
+            "source": source,
+            "normal_termination": normal_term,
+        })
+
+    valid = [x for x in prepared if x["energy"] is not None]
+    invalid = [x for x in prepared if x["energy"] is None]
+
+    valid.sort(key=lambda x: x["energy"])
+
+    kept = []
+    summary_rows = []
+
+    for rank, item in enumerate(valid, start=1):
+        rmsd = calculate_rmsd(
+            item["mol"],
+            reference_mol,
+            method=rmsd_method,
+            remove_hs_for_rmsd=remove_hs_for_rmsd
+        )
+
+        keep_flag = (rmsd is not None and rmsd < rmsd_cutoff)
+
+        if keep_flag:
+            kept.append(item["mol"])
+
+        summary_rows.append({
+            "source_file": item["source"],
+            "energy_type": energy_type,
+            "energy_hartree": item["energy"],
+            "relative_energy_kcal_mol": None,
+            "rank_by_energy": rank,
+            "status": "kept_by_reference_match" if keep_flag else "removed_by_reference_mismatch",
+            "duplicate_of": "",
+            "rmsd_to_representative": None,
+            "rmsd_to_reference": rmsd,
+            "normal_termination": item["normal_termination"],
+        })
+
+    for item in invalid:
+        summary_rows.append({
+            "source_file": item["source"],
+            "energy_type": energy_type,
+            "energy_hartree": None,
+            "relative_energy_kcal_mol": None,
+            "rank_by_energy": None,
+            "status": "energy_not_found_after_sdf_read",
+            "duplicate_of": "",
+            "rmsd_to_representative": None,
+            "rmsd_to_reference": None,
             "normal_termination": item["normal_termination"],
         })
 
@@ -269,11 +380,27 @@ def make_summary_csv_bytes(summary_rows):
 with st.sidebar:
     st.header("Settings")
 
+    mode = st.radio(
+        "RMSD mode",
+        options=[
+            "Deduplicate uploaded conformers",
+            "Compare against a reference structure",
+        ],
+        index=0
+    )
+
     energy_type = st.radio(
         "Energy type",
         options=["SCF", "Gibbs"],
         index=0,
         help="Choose which energy to extract from Gaussian log files."
+    )
+
+    rmsd_method = st.radio(
+        "RMSD calculation method",
+        options=["GetBestRMS", "AlignMol"],
+        index=0,
+        help="GetBestRMS is usually recommended for deduplication."
     )
 
     rmsd_cutoff = st.number_input(
@@ -283,7 +410,7 @@ with st.sidebar:
         value=0.20,
         step=0.01,
         format="%.2f",
-        help="Conformers with RMSD below this cutoff are treated as duplicates."
+        help="Cutoff used for duplicate removal or reference matching."
     )
 
     remove_hs_for_rmsd = st.checkbox(
@@ -301,7 +428,15 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-run_button = st.button("Run conversion and deduplication", type="primary")
+reference_file = None
+if mode == "Compare against a reference structure":
+    reference_file = st.file_uploader(
+        "Upload reference structure (.sdf)",
+        type=["sdf"],
+        accept_multiple_files=False
+    )
+
+run_button = st.button("Run conversion and filtering", type="primary")
 
 
 # =========================
@@ -312,6 +447,10 @@ if run_button:
         st.error("Please upload at least one Gaussian .log file.")
         st.stop()
 
+    if mode == "Compare against a reference structure" and reference_file is None:
+        st.error("Please upload one reference SDF file.")
+        st.stop()
+
     obabel_ok, obabel_msg = check_obabel_available()
     if not obabel_ok:
         st.error("Open Babel is not available.")
@@ -319,6 +458,14 @@ if run_button:
         st.stop()
 
     st.success(obabel_msg)
+
+    reference_mol = None
+    if reference_file is not None:
+        ref_mols = read_all_mols_from_sdf_bytes(reference_file.getvalue())
+        if not ref_mols:
+            st.error("The reference SDF could not be read by RDKit.")
+            st.stop()
+        reference_mol = ref_mols[0]
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
@@ -357,6 +504,7 @@ if run_button:
                 "status": "",
                 "duplicate_of": "",
                 "rmsd_to_representative": None,
+                "rmsd_to_reference": None,
                 "normal_termination": normal_term,
                 "obabel_stdout": conv_stdout,
                 "obabel_stderr": conv_stderr,
@@ -412,16 +560,27 @@ if run_button:
 
         all_sdf_bytes = write_sdf_bytes(mols)
 
-        kept_mols, dedupe_summary_rows = deduplicate_molecules(
-            mols=mols,
-            energy_type=energy_type,
-            rmsd_cutoff=rmsd_cutoff,
-            remove_hs_for_rmsd=remove_hs_for_rmsd
-        )
+        if mode == "Deduplicate uploaded conformers":
+            kept_mols, result_summary_rows = deduplicate_molecules(
+                mols=mols,
+                energy_type=energy_type,
+                rmsd_cutoff=rmsd_cutoff,
+                remove_hs_for_rmsd=remove_hs_for_rmsd,
+                rmsd_method=rmsd_method
+            )
+        else:
+            kept_mols, result_summary_rows = filter_against_reference(
+                mols=mols,
+                reference_mol=reference_mol,
+                energy_type=energy_type,
+                rmsd_cutoff=rmsd_cutoff,
+                remove_hs_for_rmsd=remove_hs_for_rmsd,
+                rmsd_method=rmsd_method
+            )
 
         unique_sdf_bytes = write_sdf_bytes(kept_mols)
 
-        summary_rows = dedupe_summary_rows[:]
+        summary_rows = result_summary_rows[:]
 
         for row in conversion_logs:
             if row["status"] in {"conversion_failed", "energy_not_found_in_log", "sdf_property_write_failed"}:
@@ -434,6 +593,7 @@ if run_button:
                     "status": row["status"],
                     "duplicate_of": "",
                     "rmsd_to_representative": None,
+                    "rmsd_to_reference": None,
                     "normal_termination": row["normal_termination"],
                 })
 
@@ -447,6 +607,7 @@ if run_button:
                 "status": "rdkit_read_failed_after_conversion",
                 "duplicate_of": "",
                 "rmsd_to_representative": None,
+                "rmsd_to_reference": None,
                 "normal_termination": "",
             })
 
@@ -462,7 +623,7 @@ if run_button:
         col1, col2, col3 = st.columns(3)
         col1.metric("Uploaded log files", len(uploaded_files))
         col2.metric("Valid conformers", len(mols))
-        col3.metric("Unique conformers kept", len(kept_mols))
+        col3.metric("Structures kept", len(kept_mols))
 
         st.subheader("Summary table")
         st.dataframe(display_df, use_container_width=True)
