@@ -21,6 +21,10 @@ st.set_page_config(
 st.title("Gaussian SDF Dedupe App")
 st.caption("Ver. 1.0")
 st.write("Convert Gaussian .log files to SDF, merge conformers, and filter structures by RMSD.")
+st.info(
+    "Use symmetry-aware RMSD for symmetric structures such as para-substituted benzenes. "
+    "For ordinary asymmetric structures, direct alignment RMSD can be used."
+)
 
 
 # =========================
@@ -119,17 +123,6 @@ def read_first_mol_from_sdf(sdf_path: Path):
         return mols[0]
     except Exception:
         return None
-
-
-def read_all_mols_from_sdf_bytes(sdf_bytes):
-    try:
-        text = sdf_bytes.decode("utf-8", errors="ignore")
-        suppl = Chem.SDMolSupplier()
-        suppl.SetData(text, removeHs=False)
-        mols = [m for m in suppl if m is not None]
-        return mols
-    except Exception:
-        return []
 
 
 def set_energy_property_to_sdf(
@@ -263,7 +256,6 @@ def deduplicate_molecules(
             "status": "removed_as_duplicate" if is_dup else "kept",
             "duplicate_of": duplicate_of,
             "rmsd_to_representative": best_rmsd,
-            "rmsd_to_reference": None,
             "normal_termination": item["normal_termination"],
         })
 
@@ -277,95 +269,6 @@ def deduplicate_molecules(
             "status": "energy_not_found_after_sdf_read",
             "duplicate_of": "",
             "rmsd_to_representative": None,
-            "rmsd_to_reference": None,
-            "normal_termination": item["normal_termination"],
-        })
-
-    valid_energies = [row["energy_hartree"] for row in summary_rows if row["energy_hartree"] is not None]
-    if valid_energies:
-        e0 = min(valid_energies)
-        for row in summary_rows:
-            if row["energy_hartree"] is not None:
-                row["relative_energy_kcal_mol"] = (row["energy_hartree"] - e0) * ENERGY_HARTREE_TO_KCAL
-
-    return kept, summary_rows
-
-
-def filter_against_reference(
-    mols,
-    reference_mol,
-    energy_type_label="SCF",
-    rmsd_cutoff=0.20,
-    remove_hs_for_rmsd=True,
-    rmsd_method="GetBestRMS",
-    reference_action="keep_below_cutoff"
-):
-    prepared = []
-    for idx, mol in enumerate(mols):
-        energy = get_energy(mol, energy_type_label)
-        source = mol.GetProp("SourceFile") if mol.HasProp("SourceFile") else f"mol_{idx+1}"
-        normal_term = mol.GetProp("NormalTermination") if mol.HasProp("NormalTermination") else ""
-        prepared.append({
-            "mol": mol,
-            "energy": energy,
-            "source": source,
-            "normal_termination": normal_term,
-        })
-
-    valid = [x for x in prepared if x["energy"] is not None]
-    invalid = [x for x in prepared if x["energy"] is None]
-
-    valid.sort(key=lambda x: x["energy"])
-
-    kept = []
-    summary_rows = []
-
-    for rank, item in enumerate(valid, start=1):
-        rmsd = calculate_rmsd(
-            item["mol"],
-            reference_mol,
-            method=rmsd_method,
-            remove_hs_for_rmsd=remove_hs_for_rmsd
-        )
-
-        keep_flag = False
-        status_text = "rmsd_calculation_failed"
-
-        if rmsd is not None:
-            if reference_action == "keep_below_cutoff":
-                keep_flag = rmsd < rmsd_cutoff
-                status_text = "kept_by_reference_match" if keep_flag else "removed_by_reference_mismatch"
-            else:
-                keep_flag = rmsd >= rmsd_cutoff
-                status_text = "removed_by_reference_match" if not keep_flag else "kept_by_reference_mismatch"
-
-        if keep_flag:
-            kept.append(item["mol"])
-
-        summary_rows.append({
-            "source_file": item["source"],
-            "energy_type": energy_type_label,
-            "energy_hartree": item["energy"],
-            "relative_energy_kcal_mol": None,
-            "rank_by_energy": rank,
-            "status": status_text,
-            "duplicate_of": "",
-            "rmsd_to_representative": None,
-            "rmsd_to_reference": rmsd,
-            "normal_termination": item["normal_termination"],
-        })
-
-    for item in invalid:
-        summary_rows.append({
-            "source_file": item["source"],
-            "energy_type": energy_type_label,
-            "energy_hartree": None,
-            "relative_energy_kcal_mol": None,
-            "rank_by_energy": None,
-            "status": "energy_not_found_after_sdf_read",
-            "duplicate_of": "",
-            "rmsd_to_representative": None,
-            "rmsd_to_reference": None,
             "normal_termination": item["normal_termination"],
         })
 
@@ -391,15 +294,6 @@ def make_summary_csv_bytes(summary_rows):
 with st.sidebar:
     st.header("Settings")
 
-    mode = st.radio(
-        "RMSD mode",
-        options=[
-            "Deduplicate uploaded conformers",
-            "Compare against a reference structure",
-        ],
-        index=0
-    )
-
     energy_type_ui = st.radio(
         "Energy to extract",
         options=["SCF", "Free Energy"],
@@ -412,12 +306,22 @@ with st.sidebar:
     else:
         energy_type_label = "Free Energy"
 
-    rmsd_method = st.radio(
-        "RMSD calculation method",
-        options=["GetBestRMS", "AlignMol"],
+    symmetry_mode = st.radio(
+        "Symmetry handling",
+        options=[
+            "Symmetric structure present",
+            "No symmetric structure concern",
+        ],
         index=0,
-        help="GetBestRMS is usually recommended for deduplication."
+        help="Use symmetry-aware RMSD for para-substituted benzene-like cases."
     )
+
+    if symmetry_mode == "Symmetric structure present":
+        rmsd_method = "GetBestRMS"
+        st.caption("RMSD method: GetBestRMS (symmetry-aware)")
+    else:
+        rmsd_method = "AlignMol"
+        st.caption("RMSD method: AlignMol (direct alignment)")
 
     rmsd_cutoff = st.number_input(
         "RMSD cutoff (Å)",
@@ -426,29 +330,13 @@ with st.sidebar:
         value=0.20,
         step=0.01,
         format="%.2f",
-        help="Cutoff used for duplicate removal or reference matching."
+        help="Conformers with RMSD below this cutoff are treated as duplicates."
     )
 
     remove_hs_for_rmsd = st.checkbox(
         "Use heavy-atom RMSD (remove H atoms for RMSD calculation)",
         value=True
     )
-
-    reference_action = "keep_below_cutoff"
-    if mode == "Compare against a reference structure":
-        reference_action_ui = st.radio(
-            "Reference-mode action",
-            options=[
-                "Keep structures with RMSD < cutoff",
-                "Remove structures with RMSD < cutoff",
-            ],
-            index=0
-        )
-
-        if reference_action_ui == "Keep structures with RMSD < cutoff":
-            reference_action = "keep_below_cutoff"
-        else:
-            reference_action = "remove_below_cutoff"
 
 
 # =========================
@@ -459,14 +347,6 @@ uploaded_files = st.file_uploader(
     type=["log"],
     accept_multiple_files=True
 )
-
-reference_file = None
-if mode == "Compare against a reference structure":
-    reference_file = st.file_uploader(
-        "Upload reference structure (.sdf)",
-        type=["sdf"],
-        accept_multiple_files=False
-    )
 
 run_button = st.button("Run conversion and filtering", type="primary")
 
@@ -479,10 +359,6 @@ if run_button:
         st.error("Please upload at least one Gaussian .log file.")
         st.stop()
 
-    if mode == "Compare against a reference structure" and reference_file is None:
-        st.error("Please upload one reference SDF file.")
-        st.stop()
-
     obabel_ok, obabel_msg = check_obabel_available()
     if not obabel_ok:
         st.error("Open Babel is not available.")
@@ -490,14 +366,6 @@ if run_button:
         st.stop()
 
     st.success(obabel_msg)
-
-    reference_mol = None
-    if reference_file is not None:
-        ref_mols = read_all_mols_from_sdf_bytes(reference_file.getvalue())
-        if not ref_mols:
-            st.error("The reference SDF could not be read by RDKit.")
-            st.stop()
-        reference_mol = ref_mols[0]
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
@@ -536,7 +404,6 @@ if run_button:
                 "status": "",
                 "duplicate_of": "",
                 "rmsd_to_representative": None,
-                "rmsd_to_reference": None,
                 "normal_termination": normal_term,
                 "obabel_stdout": conv_stdout,
                 "obabel_stderr": conv_stderr,
@@ -592,24 +459,13 @@ if run_button:
 
         all_sdf_bytes = write_sdf_bytes(mols)
 
-        if mode == "Deduplicate uploaded conformers":
-            kept_mols, result_summary_rows = deduplicate_molecules(
-                mols=mols,
-                energy_type_label=energy_type_label,
-                rmsd_cutoff=rmsd_cutoff,
-                remove_hs_for_rmsd=remove_hs_for_rmsd,
-                rmsd_method=rmsd_method
-            )
-        else:
-            kept_mols, result_summary_rows = filter_against_reference(
-                mols=mols,
-                reference_mol=reference_mol,
-                energy_type_label=energy_type_label,
-                rmsd_cutoff=rmsd_cutoff,
-                remove_hs_for_rmsd=remove_hs_for_rmsd,
-                rmsd_method=rmsd_method,
-                reference_action=reference_action
-            )
+        kept_mols, result_summary_rows = deduplicate_molecules(
+            mols=mols,
+            energy_type_label=energy_type_label,
+            rmsd_cutoff=rmsd_cutoff,
+            remove_hs_for_rmsd=remove_hs_for_rmsd,
+            rmsd_method=rmsd_method
+        )
 
         unique_sdf_bytes = write_sdf_bytes(kept_mols)
 
@@ -626,7 +482,6 @@ if run_button:
                     "status": row["status"],
                     "duplicate_of": "",
                     "rmsd_to_representative": None,
-                    "rmsd_to_reference": None,
                     "normal_termination": row["normal_termination"],
                 })
 
@@ -640,7 +495,6 @@ if run_button:
                 "status": "rdkit_read_failed_after_conversion",
                 "duplicate_of": "",
                 "rmsd_to_representative": None,
-                "rmsd_to_reference": None,
                 "normal_termination": "",
             })
 
