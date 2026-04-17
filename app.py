@@ -19,7 +19,8 @@ st.set_page_config(
 )
 
 st.title("Gaussian SDF Dedupe App")
-st.caption("Convert Gaussian .log files to SDF, merge conformers, and filter structures by RMSD.")
+st.caption("Ver. 1.0")
+st.write("Convert Gaussian .log files to SDF, merge conformers, and filter structures by RMSD.")
 
 
 # =========================
@@ -135,7 +136,7 @@ def set_energy_property_to_sdf(
     sdf_path: Path,
     source_name: str,
     energy_value: float,
-    energy_type: str,
+    energy_type_label: str,
     normal_termination: bool
 ):
     mol = read_first_mol_from_sdf(sdf_path)
@@ -143,8 +144,8 @@ def set_energy_property_to_sdf(
         return False, "RDKit failed to read the generated SDF."
 
     mol.SetProp("SourceFile", source_name)
-    mol.SetProp("EnergyType", energy_type)
-    mol.SetProp(energy_type, str(energy_value))
+    mol.SetProp("EnergyType", energy_type_label)
+    mol.SetProp(energy_type_label, str(energy_value))
     mol.SetProp("NormalTermination", "True" if normal_termination else "False")
 
     writer = Chem.SDWriter(str(sdf_path))
@@ -165,10 +166,10 @@ def load_molecules_from_sdfs(sdf_paths):
     return mols, failed
 
 
-def get_energy(mol, energy_type):
-    if mol.HasProp(energy_type):
+def get_energy(mol, energy_type_label):
+    if mol.HasProp(energy_type_label):
         try:
-            return float(mol.GetProp(energy_type))
+            return float(mol.GetProp(energy_type_label))
         except Exception:
             return None
     return None
@@ -200,14 +201,14 @@ def calculate_rmsd(mol_a, mol_b, method="GetBestRMS", remove_hs_for_rmsd=True):
 
 def deduplicate_molecules(
     mols,
-    energy_type="SCF",
+    energy_type_label="SCF",
     rmsd_cutoff=0.20,
     remove_hs_for_rmsd=True,
     rmsd_method="GetBestRMS"
 ):
     prepared = []
     for idx, mol in enumerate(mols):
-        energy = get_energy(mol, energy_type)
+        energy = get_energy(mol, energy_type_label)
         source = mol.GetProp("SourceFile") if mol.HasProp("SourceFile") else f"mol_{idx+1}"
         normal_term = mol.GetProp("NormalTermination") if mol.HasProp("NormalTermination") else ""
         prepared.append({
@@ -255,7 +256,7 @@ def deduplicate_molecules(
 
         summary_rows.append({
             "source_file": item["source"],
-            "energy_type": energy_type,
+            "energy_type": energy_type_label,
             "energy_hartree": item["energy"],
             "relative_energy_kcal_mol": None,
             "rank_by_energy": rank,
@@ -269,7 +270,7 @@ def deduplicate_molecules(
     for item in invalid:
         summary_rows.append({
             "source_file": item["source"],
-            "energy_type": energy_type,
+            "energy_type": energy_type_label,
             "energy_hartree": None,
             "relative_energy_kcal_mol": None,
             "rank_by_energy": None,
@@ -293,14 +294,15 @@ def deduplicate_molecules(
 def filter_against_reference(
     mols,
     reference_mol,
-    energy_type="SCF",
+    energy_type_label="SCF",
     rmsd_cutoff=0.20,
     remove_hs_for_rmsd=True,
-    rmsd_method="GetBestRMS"
+    rmsd_method="GetBestRMS",
+    reference_action="keep_below_cutoff"
 ):
     prepared = []
     for idx, mol in enumerate(mols):
-        energy = get_energy(mol, energy_type)
+        energy = get_energy(mol, energy_type_label)
         source = mol.GetProp("SourceFile") if mol.HasProp("SourceFile") else f"mol_{idx+1}"
         normal_term = mol.GetProp("NormalTermination") if mol.HasProp("NormalTermination") else ""
         prepared.append({
@@ -326,18 +328,27 @@ def filter_against_reference(
             remove_hs_for_rmsd=remove_hs_for_rmsd
         )
 
-        keep_flag = (rmsd is not None and rmsd < rmsd_cutoff)
+        keep_flag = False
+        status_text = "rmsd_calculation_failed"
+
+        if rmsd is not None:
+            if reference_action == "keep_below_cutoff":
+                keep_flag = rmsd < rmsd_cutoff
+                status_text = "kept_by_reference_match" if keep_flag else "removed_by_reference_mismatch"
+            else:
+                keep_flag = rmsd >= rmsd_cutoff
+                status_text = "removed_by_reference_match" if not keep_flag else "kept_by_reference_mismatch"
 
         if keep_flag:
             kept.append(item["mol"])
 
         summary_rows.append({
             "source_file": item["source"],
-            "energy_type": energy_type,
+            "energy_type": energy_type_label,
             "energy_hartree": item["energy"],
             "relative_energy_kcal_mol": None,
             "rank_by_energy": rank,
-            "status": "kept_by_reference_match" if keep_flag else "removed_by_reference_mismatch",
+            "status": status_text,
             "duplicate_of": "",
             "rmsd_to_representative": None,
             "rmsd_to_reference": rmsd,
@@ -347,7 +358,7 @@ def filter_against_reference(
     for item in invalid:
         summary_rows.append({
             "source_file": item["source"],
-            "energy_type": energy_type,
+            "energy_type": energy_type_label,
             "energy_hartree": None,
             "relative_energy_kcal_mol": None,
             "rank_by_energy": None,
@@ -389,12 +400,17 @@ with st.sidebar:
         index=0
     )
 
-    energy_type = st.radio(
-        "Energy type",
-        options=["SCF", "Gibbs"],
+    energy_type_ui = st.radio(
+        "Energy to extract",
+        options=["SCF", "Free Energy"],
         index=0,
         help="Choose which energy to extract from Gaussian log files."
     )
+
+    if energy_type_ui == "SCF":
+        energy_type_label = "SCF"
+    else:
+        energy_type_label = "Free Energy"
 
     rmsd_method = st.radio(
         "RMSD calculation method",
@@ -406,7 +422,7 @@ with st.sidebar:
     rmsd_cutoff = st.number_input(
         "RMSD cutoff (Å)",
         min_value=0.01,
-        max_value=5.00,
+        max_value=10.00,
         value=0.20,
         step=0.01,
         format="%.2f",
@@ -417,6 +433,22 @@ with st.sidebar:
         "Use heavy-atom RMSD (remove H atoms for RMSD calculation)",
         value=True
     )
+
+    reference_action = "keep_below_cutoff"
+    if mode == "Compare against a reference structure":
+        reference_action_ui = st.radio(
+            "Reference-mode action",
+            options=[
+                "Keep structures with RMSD < cutoff",
+                "Remove structures with RMSD < cutoff",
+            ],
+            index=0
+        )
+
+        if reference_action_ui == "Keep structures with RMSD < cutoff":
+            reference_action = "keep_below_cutoff"
+        else:
+            reference_action = "remove_below_cutoff"
 
 
 # =========================
@@ -488,7 +520,7 @@ if run_button:
 
             normal_term = check_normal_termination(log_path)
 
-            if energy_type == "SCF":
+            if energy_type_label == "SCF":
                 energy_value = extract_last_scf_energy(log_path)
             else:
                 energy_value = extract_gibbs_energy(log_path)
@@ -497,7 +529,7 @@ if run_button:
 
             record = {
                 "source_file": uploaded_file.name,
-                "energy_type": energy_type,
+                "energy_type": energy_type_label,
                 "energy_hartree": energy_value,
                 "relative_energy_kcal_mol": None,
                 "rank_by_energy": None,
@@ -526,7 +558,7 @@ if run_button:
                 sdf_path=sdf_path,
                 source_name=uploaded_file.name,
                 energy_value=energy_value,
-                energy_type=energy_type,
+                energy_type_label=energy_type_label,
                 normal_termination=normal_term
             )
 
@@ -563,7 +595,7 @@ if run_button:
         if mode == "Deduplicate uploaded conformers":
             kept_mols, result_summary_rows = deduplicate_molecules(
                 mols=mols,
-                energy_type=energy_type,
+                energy_type_label=energy_type_label,
                 rmsd_cutoff=rmsd_cutoff,
                 remove_hs_for_rmsd=remove_hs_for_rmsd,
                 rmsd_method=rmsd_method
@@ -572,10 +604,11 @@ if run_button:
             kept_mols, result_summary_rows = filter_against_reference(
                 mols=mols,
                 reference_mol=reference_mol,
-                energy_type=energy_type,
+                energy_type_label=energy_type_label,
                 rmsd_cutoff=rmsd_cutoff,
                 remove_hs_for_rmsd=remove_hs_for_rmsd,
-                rmsd_method=rmsd_method
+                rmsd_method=rmsd_method,
+                reference_action=reference_action
             )
 
         unique_sdf_bytes = write_sdf_bytes(kept_mols)
@@ -600,7 +633,7 @@ if run_button:
         for name in sdf_read_failed:
             summary_rows.append({
                 "source_file": name,
-                "energy_type": energy_type,
+                "energy_type": energy_type_label,
                 "energy_hartree": None,
                 "relative_energy_kcal_mol": None,
                 "rank_by_energy": None,
