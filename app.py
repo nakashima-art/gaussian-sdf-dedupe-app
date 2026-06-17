@@ -141,8 +141,6 @@ UI_TEXT = {
         "status_rdkit_read_failed": "RDKit read failed",
         "status_unsupported_file_type": "unsupported file type",
         "status_manual_property_not_found": "specified SDF property not found",
-        "normal_term_true": "True",
-        "normal_term_false": "False",
     },
     "ja": {
         "language_selector": "Language / 言語",
@@ -212,8 +210,6 @@ UI_TEXT = {
         "status_rdkit_read_failed": "RDKit 読み込み失敗",
         "status_unsupported_file_type": "非対応ファイル形式",
         "status_manual_property_not_found": "指定した SDF プロパティが見つからない",
-        "normal_term_true": "True",
-        "normal_term_false": "False",
     },
 }
 
@@ -309,6 +305,53 @@ def parse_float(value):
         return float(match.group(0))
     except Exception:
         return None
+
+
+def sanitize_filename_part(text):
+    text = Path(text).stem
+    text = re.sub(r"[^\w\-\.]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_.-")
+    return text or "output"
+
+
+def longest_common_prefix(strings):
+    if not strings:
+        return ""
+
+    prefix = strings[0]
+    for s in strings[1:]:
+        i = 0
+        max_len = min(len(prefix), len(s))
+        while i < max_len and prefix[i] == s[i]:
+            i += 1
+        prefix = prefix[:i]
+        if not prefix:
+            break
+    return prefix
+
+
+def clean_common_prefix(prefix):
+    prefix = prefix.strip("_.- ")
+    prefix = re.sub(r"[_\-.]+$", "", prefix)
+    return prefix
+
+
+def build_output_prefix(uploaded_files, min_prefix_len=3, fallback="output"):
+    stems = [sanitize_filename_part(f.name) for f in uploaded_files]
+
+    if not stems:
+        return fallback
+
+    if len(stems) == 1:
+        return stems[0]
+
+    prefix = longest_common_prefix(stems)
+    prefix = clean_common_prefix(prefix)
+
+    if len(prefix) >= min_prefix_len:
+        return prefix
+
+    return fallback
 
 
 def extract_last_scf_energy(logfile: Path):
@@ -689,24 +732,26 @@ def render_results(payload, lang, texts):
     st.subheader(texts["download_outputs"])
     d1, d2, d3 = st.columns(3)
 
+    output_prefix = payload.get("output_prefix", "output")
+
     d1.download_button(
         label=texts["download_all"],
         data=payload["all_sdf_bytes"],
-        file_name="all_conformers.sdf",
+        file_name=f"{output_prefix}_all_conformers.sdf",
         mime="chemical/x-mdl-sdfile"
     )
 
     d2.download_button(
         label=texts["download_unique"],
         data=payload["unique_sdf_bytes"],
-        file_name="unique_conformers.sdf",
+        file_name=f"{output_prefix}_unique_conformers.sdf",
         mime="chemical/x-mdl-sdfile"
     )
 
     d3.download_button(
         label=texts["download_summary"],
         data=payload["summary_csv_bytes"],
-        file_name="summary.csv",
+        file_name=f"{output_prefix}_summary.csv",
         mime="text/csv"
     )
 
@@ -844,6 +889,8 @@ if run_button:
     if not uploaded_files:
         st.error(texts["need_file"])
         st.stop()
+
+    output_prefix = build_output_prefix(uploaded_files)
 
     needs_obabel = any(Path(f.name).suffix.lower() == ".log" for f in uploaded_files)
     if needs_obabel:
@@ -1061,6 +1108,7 @@ if run_button:
             "summary_csv_bytes": summary_csv_bytes,
             "processing_logs_df": processing_logs_df,
             "mixed_input_types": len(input_types_seen) > 1,
+            "output_prefix": output_prefix,
         }
         st.session_state.results_ready = True
 
