@@ -1,17 +1,27 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
-import numpy as np
+import tempfile
+import subprocess
 import re
-import json
+import io
 from pathlib import Path
 
-st.set_page_config(page_title="Gaussian NMR Boltzmann Averaging App", layout="wide")
+from rdkit import Chem
+from rdkit.Chem import AllChem
 
-HARTREE_TO_KCAL = 627.509474
-R_KCAL = 0.0019872041  # kcal mol^-1 K^-1
 
-APP_VERSION = "2.2"
+# =========================
+# Page config
+# =========================
+st.set_page_config(
+    page_title="Gaussian / SDF Dedupe App",
+    layout="wide",
+)
+
+# =========================
+# App metadata
+# =========================
+APP_VERSION = "1.1"
 
 DEVELOPER_INFO = {
     "name": "Ken-ichi Nakashima",
@@ -19,527 +29,282 @@ DEVELOPER_INFO = {
     "affiliation_en": "Aichi-Gakuin University, School of Pharmacy, Laboratory of Natural Resources",
 }
 
-_COMPONENT_DIR = Path(__file__).parent / "atom_picker_component"
-atom_picker_component = components.declare_component(
-    "atom_picker_component",
-    path=str(_COMPONENT_DIR),
-)
+# Internal property names used in this app
+APP_ENERGY_PROP = "AppEnergy"
+APP_ENERGY_TYPE_PROP = "AppEnergyType"
+APP_ENERGY_UNIT_PROP = "AppEnergyUnit"
+APP_ENERGY_SOURCE_PROP = "AppEnergySource"
+APP_SOURCE_FILE_PROP = "SourceFile"
+APP_SOURCE_LABEL_PROP = "SourceLabel"
+APP_INPUT_TYPE_PROP = "InputType"
+APP_RECORD_INDEX_PROP = "RecordIndex"
+APP_NORMAL_TERM_PROP = "NormalTermination"
 
-ATOMIC_NUMBER_TO_SYMBOL = {
-    1: "H", 2: "He",
-    3: "Li", 4: "Be", 5: "B", 6: "C", 7: "N", 8: "O", 9: "F", 10: "Ne",
-    11: "Na", 12: "Mg", 13: "Al", 14: "Si", 15: "P", 16: "S", 17: "Cl", 18: "Ar",
-    19: "K", 20: "Ca", 21: "Sc", 22: "Ti", 23: "V", 24: "Cr", 25: "Mn", 26: "Fe",
-    27: "Co", 28: "Ni", 29: "Cu", 30: "Zn", 31: "Ga", 32: "Ge", 33: "As", 34: "Se",
-    35: "Br", 36: "Kr", 53: "I",
-}
+# =========================
+# Regex / constants
+# =========================
+SCF_RE = re.compile(r"SCF Done:\s+E\([RU]?\w+\)\s+=\s+(-?\d+\.\d+)")
+ARCHIVE_HF_RE = re.compile(r"\|HF=(-?\d+\.\d+)")
+FLOAT_RE = re.compile(r"[-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?")
 
+GIBBS_KEY = "Sum of electronic and thermal Free Energies"
+NORMAL_TERM_KEY = "Normal termination of Gaussian"
+
+ENERGY_HARTREE_TO_KCAL = 627.509474
+ENERGY_KJ_TO_KCAL = 1.0 / 4.184
+
+COMMON_SDF_ENERGY_PROPS = [
+    "Energy",
+    "energy",
+    "ENERGY",
+    "MMFF94 Energy",
+    "MMFF94_energy",
+    "CONFLEX Energy",
+    "CONFLEX_Energy",
+    "Total Energy",
+    "Final Energy",
+    "E",
+    "SCF",
+    "Free Energy",
+    "Gibbs Free Energy",
+]
+
+# =========================
+# UI text
+# =========================
 UI_TEXT = {
     "en": {
-        "title": "Gaussian NMR Boltzmann Averaging App",
+        "language_selector": "Language / 言語",
+        "title": "Gaussian / SDF Dedupe App",
         "caption": f"Ver. {APP_VERSION}",
-        "description": (
-            "Upload Gaussian opt+freq logs and GIAO logs, match conformers by filename, "
-            "extract SCF or Gibbs free energies, calculate Boltzmann-averaged isotropic shieldings, "
-            "and convert them to chemical shifts using manual references, a TMS log, or linear scaling."
+        "description": "Convert Gaussian .log files to SDF, read conformer SDF files, and filter structures by RMSD.",
+        "info": (
+            "This app supports Gaussian .log files and conformer .sdf files (e.g., CONFLEX output). "
+            "For SDF input, select the energy property and unit appropriately. "
+            "If you mix Gaussian and SDF files in one run, energy ranking is only meaningful when the energy scales are comparable."
         ),
         "settings": "Settings",
         "developer_info": "Developer information",
         "developer_name": "Name",
         "developer_affiliation": "Affiliation",
-        "temperature": "Temperature (K)",
-        "energy_mode": "Energy to use for Boltzmann weighting",
-        "energy_gibbs": "Gibbs free energy",
-        "energy_scf": "SCF energy",
-        "shift_mode": "Chemical shift conversion method",
-        "shift_manual": "Manual reference shielding",
-        "shift_tms": "TMS log file",
-        "shift_linear": "Linear scaling",
-        "ref_h": "Reference shielding for 1H",
-        "ref_c": "Reference shielding for 13C",
-        "upload_tms": "Upload TMS GIAO log file",
-        "tms_success": "TMS reference extracted successfully.",
-        "tms_prev": "Previously loaded TMS reference is being used.",
-        "tms_prompt": "Please upload a TMS GIAO log file.",
-        "tms_file": "File",
-        "tms_h": "TMS 1H reference shielding",
-        "tms_c": "TMS 13C reference shielding",
-        "slope_h": "Slope for 1H",
-        "intercept_h": "Intercept for 1H",
-        "slope_c": "Slope for 13C",
-        "intercept_c": "Intercept for 13C",
-        "element_filter": "Element filter for display",
-        "all": "All",
-        "h": "H",
-        "c": "C",
-        "other": "Other",
-        "upload_header": "1. Upload files",
-        "upload_opt": "Upload opt+freq log files",
-        "upload_giao": "Upload GIAO log files",
-        "matched_header": "2. Matched conformers",
-        "no_valid": "No valid matched conformers were found.",
-        "tms_not_ready": "TMS reference has not been loaded yet. Please upload a valid TMS GIAO log file in the sidebar.",
-        "weights_header": "3. Energies and Boltzmann weights",
-        "shielding_header": "4. Isotropic shielding table for each conformer",
-        "avg_header": "5. Per-atom Boltzmann-averaged shielding / shift table",
-        "mapping_header": "6. Atom mapping",
-        "mapping_desc": "Click one or more atoms in the 3D structure, assign a proton label, and save the mapping. Multiple selected atoms are treated as an interchangeable group.",
-        "click_atoms": "#### Click atoms in the 3D structure",
-        "viewer_caption": "Hydrogen atom numbers are shown by default. Use the checkboxes above the viewer to display all atom numbers or to show hydrogens only.",
-        "new_mapping": "#### New proton mapping",
-        "selected": "Selected: {items}",
-        "none_selected": "No atom is selected yet.",
-        "label_entry": "Label entry",
-        "build_label": "Build H label",
-        "free_text": "Free text",
-        "position_number": "Position number",
-        "position_placeholder": "e.g. 3",
-        "prime": "Prime",
-        "display_label": "Display label: **{label}**",
-        "label": "Label",
-        "label_placeholder": "e.g. H-2′ / H-6′",
-        "save_mapping": "Save mapping",
-        "clear_selection": "Clear selection",
-        "enter_label": "Enter a proton label.",
-        "select_atom": "Select at least one atom in the 3D structure.",
-        "non_hydrogen": "The following selected atoms are not hydrogen atoms: {atoms}",
-        "added": "Added {label}.",
-        "updated": "Updated {label}.",
-        "manual_fallback": "Manual selection fallback",
-        "manual_desc": "Use this only when clicking the 3D structure is difficult.",
-        "manual_numbers": "1-based atom numbers, separated by commas",
-        "apply_manual": "Apply manual selection",
-        "out_of_range": "Out-of-range atom numbers: {atoms}",
-        "integer_error": "Enter integers separated by commas.",
-        "registered_mappings": "#### Registered mappings",
-        "no_mappings": "No mappings have been registered.",
-        "not_assigned": "Not assigned",
-        "atoms_label": "Atom(s)",
-        "show_edit": "Show/edit atoms",
-        "delete": "Delete",
-        "mapping_status": "Mapping status",
-        "mapping_labels": "Labels",
-        "mapping_registered": "Registered labels",
-        "eq_avg_header": "7. Equivalent-atom averaged table",
-        "download_header": "8. Download outputs",
-        "download_per_conf": "Download per-conformer shielding table (CSV)",
-        "download_avg": "Download per-atom Boltzmann averaged table (CSV)",
-        "download_weights": "Download energy / weight table (CSV)",
-        "download_eq": "Download equivalent-atom averaged table (CSV)",
-        "settings_io_header": "Settings save / load",
-        "download_settings": "Download mapping settings (JSON)",
-        "upload_settings": "Upload mapping settings (JSON)",
-        "settings_loaded": "Settings file loaded successfully.",
-        "settings_load_error": "Failed to load settings JSON.",
-        "clear_mappings": "Clear mappings",
-        "filename_prefix_info": "Output filenames use the common prefix of uploaded GIAO files.",
-        "summary_columns_note": "The Boltzmann-averaged table includes weight_<conf_id> columns.",
-        "coord_not_found": "No coordinate block could be extracted from valid files, so the structure picker is unavailable.",
-        "save_project_desc": "The JSON file stores only proton labels / equivalent groups, not the Gaussian logs or calculation results.",
+        "log_energy_header": "Gaussian .log settings",
+        "energy_to_extract": "Energy to extract from Gaussian .log",
+        "scf": "SCF",
+        "free_energy": "Free Energy",
+        "sdf_energy_header": "SDF settings",
+        "sdf_energy_mode": "SDF energy property",
+        "auto_detect": "Auto-detect common energy property",
+        "manual_property": "Specify property name manually",
+        "sdf_property_name": "SDF property name",
+        "sdf_property_hint": "Examples: Energy, MMFF94 Energy, CONFLEX Energy",
+        "sdf_energy_unit": "SDF energy unit",
+        "hartree": "Hartree",
+        "kcal_mol": "kcal/mol",
+        "kj_mol": "kJ/mol",
+        "unknown_unit": "Unknown (do not calculate relative energy)",
+        "symmetry_header": "RMSD settings",
+        "symmetry_handling": "Symmetry handling",
+        "symmetric_present": "Symmetric structure present",
+        "no_symmetric_concern": "No symmetric structure concern",
+        "rmsd_getbestrms": "RMSD method: GetBestRMS (symmetry-aware)",
+        "rmsd_alignmol": "RMSD method: AlignMol (direct alignment)",
+        "rmsd_cutoff": "RMSD cutoff (Å)",
+        "rmsd_cutoff_help": "Conformers with RMSD below this cutoff are treated as duplicates.",
+        "heavy_atom_rmsd": "Use heavy-atom RMSD (remove H atoms for RMSD calculation)",
+        "clear_results": "Clear results",
+        "upload_files": "Upload Gaussian .log and/or conformer .sdf files",
+        "run_button": "Run processing and filtering",
+        "need_file": "Please upload at least one .log or .sdf file.",
+        "obabel_not_available": "Open Babel is not available.",
+        "processing": "Processing",
+        "conversion_finished": "File processing finished.",
+        "no_valid_molecules": "No valid structures could be loaded.",
+        "results": "Results",
+        "uploaded_files_metric": "Uploaded files",
+        "loaded_conformers_metric": "Loaded conformers",
+        "kept_structures_metric": "Structures kept",
+        "summary_table": "Summary table",
+        "download_outputs": "Download outputs",
+        "download_all": "Download all_conformers.sdf",
+        "download_unique": "Download unique_conformers.sdf",
+        "download_summary": "Download summary.csv",
+        "show_details": "Show processing details",
+        "no_details": "No processing issues were recorded.",
+        "mixed_input_warning": (
+            "Both Gaussian .log and SDF files are included. "
+            "Representative selection is only meaningful when all uploaded energies are on a comparable scale."
+        ),
+        "status_kept": "kept",
+        "status_removed_as_duplicate": "removed as duplicate",
+        "status_energy_not_found": "energy not found",
+        "status_conversion_failed": "conversion failed",
+        "status_rdkit_read_failed": "RDKit read failed",
+        "status_unsupported_file_type": "unsupported file type",
+        "status_manual_property_not_found": "specified SDF property not found",
     },
     "ja": {
-        "title": "Gaussian NMR Boltzmann Averaging App",
+        "language_selector": "Language / 言語",
+        "title": "Gaussian / SDF Dedupe App",
         "caption": f"Ver. {APP_VERSION}",
-        "description": (
-            "Gaussian の opt+freq ログと GIAO ログをアップロードし、ファイル名で配座を対応付け、"
-            "SCF energy または Gibbs free energy を抽出し、Boltzmann 平均 isotropic shielding を計算し、"
-            "手動参照値・TMS ログ・線形補正式を用いて chemical shift に変換します。"
+        "description": "Gaussian .log ファイルのSDF変換、および配座SDFファイルの読み込みを行い、RMSDに基づいて重複構造を除外します。",
+        "info": (
+            "Gaussian .log ファイルと、CONFLEX などが出力した配座 .sdf ファイルの両方に対応しています。"
+            "SDF入力では、エネルギープロパティ名と単位を適切に設定してください。"
+            "Gaussian と SDF を同時に投入する場合、エネルギー尺度が比較可能なときのみ順位づけに意味があります。"
         ),
         "settings": "設定",
         "developer_info": "開発者情報",
         "developer_name": "氏名",
         "developer_affiliation": "所属",
-        "temperature": "温度 (K)",
-        "energy_mode": "Boltzmann 重み付けに使うエネルギー",
-        "energy_gibbs": "Gibbs free energy",
-        "energy_scf": "SCF energy",
-        "shift_mode": "Chemical shift の変換方法",
-        "shift_manual": "手動参照 shielding",
-        "shift_tms": "TMS ログファイル",
-        "shift_linear": "線形補正式",
-        "ref_h": "1H の参照 shielding",
-        "ref_c": "13C の参照 shielding",
-        "upload_tms": "TMS の GIAO ログをアップロード",
-        "tms_success": "TMS 参照値を正常に抽出しました。",
-        "tms_prev": "前回読み込んだ TMS 参照値を使用しています。",
-        "tms_prompt": "TMS の GIAO ログをアップロードしてください。",
-        "tms_file": "ファイル",
-        "tms_h": "TMS 1H 参照 shielding",
-        "tms_c": "TMS 13C 参照 shielding",
-        "slope_h": "1H の slope",
-        "intercept_h": "1H の intercept",
-        "slope_c": "13C の slope",
-        "intercept_c": "13C の intercept",
-        "element_filter": "表示元素フィルター",
-        "all": "All",
-        "h": "H",
-        "c": "C",
-        "other": "Other",
-        "upload_header": "1. ファイルアップロード",
-        "upload_opt": "opt+freq ログをアップロード",
-        "upload_giao": "GIAO ログをアップロード",
-        "matched_header": "2. 対応付けられた配座",
-        "no_valid": "有効な対応配座が見つかりませんでした。",
-        "tms_not_ready": "TMS 参照値がまだ読み込まれていません。サイドバーから有効な TMS GIAO ログをアップロードしてください。",
-        "weights_header": "3. エネルギーと Boltzmann 存在比",
-        "shielding_header": "4. 各配座の isotropic shielding テーブル",
-        "avg_header": "5. 原子ごとの Boltzmann 平均 shielding / shift テーブル",
-        "mapping_header": "6. Atom mapping",
-        "mapping_desc": "3D 構造上で1つ以上の原子を選択し、プロトンラベルを付けて保存します。複数選択した原子は交換可能なグループとして扱います。",
-        "click_atoms": "#### 3D 構造上で原子をクリック",
-        "viewer_caption": "初期状態では水素原子番号が表示されます。上部のチェックボックスで全原子番号表示や水素のみ表示に切り替えられます。",
-        "new_mapping": "#### 新しいプロトンマッピング",
-        "selected": "選択中: {items}",
-        "none_selected": "まだ原子が選択されていません。",
-        "label_entry": "ラベル入力",
-        "build_label": "Hラベルを組み立て",
-        "free_text": "自由入力",
-        "position_number": "位置番号",
-        "position_placeholder": "例: 3",
-        "prime": "Prime",
-        "display_label": "表示ラベル: **{label}**",
-        "label": "ラベル",
-        "label_placeholder": "例: H-2′ / H-6′",
-        "save_mapping": "マッピングを保存",
-        "clear_selection": "選択をクリア",
-        "enter_label": "プロトンラベルを入力してください。",
-        "select_atom": "少なくとも1つ原子を選択してください。",
-        "non_hydrogen": "以下の選択原子は水素ではありません: {atoms}",
-        "added": "{label} を追加しました。",
-        "updated": "{label} を更新しました。",
-        "manual_fallback": "手動選択フォールバック",
-        "manual_desc": "3D 構造上でのクリックが難しい場合にのみ使ってください。",
-        "manual_numbers": "1始まりの原子番号をカンマ区切りで入力",
-        "apply_manual": "手動選択を適用",
-        "out_of_range": "範囲外の原子番号: {atoms}",
-        "integer_error": "整数をカンマ区切りで入力してください。",
-        "registered_mappings": "#### 登録済みマッピング",
-        "no_mappings": "まだマッピングは登録されていません。",
-        "not_assigned": "未割り当て",
-        "atoms_label": "原子",
-        "show_edit": "原子を表示/編集",
-        "delete": "削除",
-        "mapping_status": "マッピング状況",
-        "mapping_labels": "ラベル",
-        "mapping_registered": "登録数",
-        "eq_avg_header": "7. Equivalent atom 平均テーブル",
-        "download_header": "8. 出力ファイルのダウンロード",
-        "download_per_conf": "各配座 shielding テーブル (CSV) をダウンロード",
-        "download_avg": "原子ごとの Boltzmann 平均テーブル (CSV) をダウンロード",
-        "download_weights": "エネルギー / 存在比テーブル (CSV) をダウンロード",
-        "download_eq": "Equivalent atom 平均テーブル (CSV) をダウンロード",
-        "settings_io_header": "設定の保存 / 読み込み",
-        "download_settings": "マッピング設定 (JSON) をダウンロード",
-        "upload_settings": "マッピング設定 (JSON) をアップロード",
-        "settings_loaded": "設定ファイルを正常に読み込みました。",
-        "settings_load_error": "設定 JSON の読み込みに失敗しました。",
-        "clear_mappings": "マッピングをクリア",
-        "filename_prefix_info": "出力ファイル名にはアップロードした GIAO ファイルの共通接頭辞を使用します。",
-        "summary_columns_note": "Boltzmann 平均テーブルには weight_<conf_id> 列を含みます。",
-        "coord_not_found": "有効ファイルから座標ブロックを抽出できなかったため、構造ピッカーは使用できません。",
-        "save_project_desc": "JSON ファイルにはプロトンラベル / equivalent group の情報のみを保存し、Gaussian ログや計算結果は保存しません。",
+        "log_energy_header": "Gaussian .log の設定",
+        "energy_to_extract": "Gaussian .log から抽出するエネルギー",
+        "scf": "SCF",
+        "free_energy": "自由エネルギー",
+        "sdf_energy_header": "SDF の設定",
+        "sdf_energy_mode": "SDF のエネルギープロパティ",
+        "auto_detect": "代表的なエネルギープロパティを自動検出",
+        "manual_property": "プロパティ名を手動指定",
+        "sdf_property_name": "SDF のプロパティ名",
+        "sdf_property_hint": "例: Energy, MMFF94 Energy, CONFLEX Energy",
+        "sdf_energy_unit": "SDF のエネルギー単位",
+        "hartree": "Hartree",
+        "kcal_mol": "kcal/mol",
+        "kj_mol": "kJ/mol",
+        "unknown_unit": "不明（相対エネルギーを計算しない）",
+        "symmetry_header": "RMSD の設定",
+        "symmetry_handling": "対称性の扱い",
+        "symmetric_present": "対称構造あり",
+        "no_symmetric_concern": "対称構造を特に考慮しない",
+        "rmsd_getbestrms": "RMSD法: GetBestRMS（対称性考慮）",
+        "rmsd_alignmol": "RMSD法: AlignMol（直接アラインメント）",
+        "rmsd_cutoff": "RMSD cutoff (Å)",
+        "rmsd_cutoff_help": "この値未満のRMSDを示す配座は重複とみなします。",
+        "heavy_atom_rmsd": "重原子RMSDを使用（水素を除去してRMSD計算）",
+        "clear_results": "結果をクリア",
+        "upload_files": "Gaussian .log および / または配座 .sdf ファイルをアップロード",
+        "run_button": "処理とフィルタリングを実行",
+        "need_file": ".log または .sdf ファイルを少なくとも1つアップロードしてください。",
+        "obabel_not_available": "Open Babel が利用できません。",
+        "processing": "処理中",
+        "conversion_finished": "ファイル処理が完了しました。",
+        "no_valid_molecules": "有効な構造を読み込めませんでした。",
+        "results": "結果",
+        "uploaded_files_metric": "アップロードファイル数",
+        "loaded_conformers_metric": "読み込まれた配座数",
+        "kept_structures_metric": "保持された構造数",
+        "summary_table": "サマリーテーブル",
+        "download_outputs": "出力ファイルのダウンロード",
+        "download_all": "all_conformers.sdf をダウンロード",
+        "download_unique": "unique_conformers.sdf をダウンロード",
+        "download_summary": "summary.csv をダウンロード",
+        "show_details": "処理詳細を表示",
+        "no_details": "記録すべき処理上の問題はありませんでした。",
+        "mixed_input_warning": (
+            "Gaussian .log と SDF が同時に含まれています。"
+            "すべてのエネルギーが比較可能な尺度にある場合にのみ、代表構造の選択に意味があります。"
+        ),
+        "status_kept": "保持",
+        "status_removed_as_duplicate": "重複として除外",
+        "status_energy_not_found": "エネルギー未検出",
+        "status_conversion_failed": "変換失敗",
+        "status_rdkit_read_failed": "RDKit 読み込み失敗",
+        "status_unsupported_file_type": "非対応ファイル形式",
+        "status_manual_property_not_found": "指定した SDF プロパティが見つからない",
     },
 }
 
+COLUMN_LABELS = {
+    "en": {
+        "source_label": "source_label",
+        "source_file": "source_file",
+        "input_type": "input_type",
+        "record_index": "record_index",
+        "energy_type": "energy_type",
+        "energy_property": "energy_property",
+        "energy_unit": "energy_unit",
+        "energy_value": "energy_value",
+        "relative_energy_kcal_mol": "relative_energy_kcal_mol",
+        "rank_by_energy": "rank_by_energy",
+        "status": "status",
+        "duplicate_of": "duplicate_of",
+        "rmsd_to_representative": "rmsd_to_representative",
+        "normal_termination": "normal_termination",
+    },
+    "ja": {
+        "source_label": "ソースラベル",
+        "source_file": "元ファイル",
+        "input_type": "入力形式",
+        "record_index": "レコード番号",
+        "energy_type": "エネルギー種別",
+        "energy_property": "エネルギープロパティ",
+        "energy_unit": "エネルギー単位",
+        "energy_value": "エネルギー値",
+        "relative_energy_kcal_mol": "相対エネルギー (kcal/mol)",
+        "rank_by_energy": "エネルギー順位",
+        "status": "状態",
+        "duplicate_of": "重複先",
+        "rmsd_to_representative": "代表構造へのRMSD",
+        "normal_termination": "Gaussian正常終了",
+    },
+}
 
-def current_language():
-    return "ja" if st.session_state.get("ui_language", "English") == "日本語" else "en"
+# =========================
+# Session state initialization
+# =========================
+if "results_ready" not in st.session_state:
+    st.session_state.results_ready = False
 
-
-def t(key: str, **kwargs):
-    text = UI_TEXT[current_language()].get(key, key)
-    return text.format(**kwargs) if kwargs else text
-
+if "result_payload" not in st.session_state:
+    st.session_state.result_payload = None
 
 if "ui_language" not in st.session_state:
-    st.session_state["ui_language"] = "English"
-if "tms_ref_H" not in st.session_state:
-    st.session_state["tms_ref_H"] = None
-if "tms_ref_C" not in st.session_state:
-    st.session_state["tms_ref_C"] = None
-if "tms_ref_filename" not in st.session_state:
-    st.session_state["tms_ref_filename"] = None
-if "latest_atom_table" not in st.session_state:
-    st.session_state["latest_atom_table"] = pd.DataFrame(columns=["atom_index", "element"])
-if "latest_xyz" not in st.session_state:
-    st.session_state["latest_xyz"] = ""
-if "atom_mappings" not in st.session_state:
-    st.session_state["atom_mappings"] = []
-if "mapping_selection" not in st.session_state:
-    st.session_state["mapping_selection"] = []
-if "settings_loaded_once" not in st.session_state:
-    st.session_state["settings_loaded_once"] = False
+    st.session_state.ui_language = "English"
 
 
-def atom_picker(atoms, xyz_text, selected_atoms=None, height=520, language="ja", key=None):
-    default_selection = sorted(set(int(x) for x in (selected_atoms or [])))
-    value = atom_picker_component(
-        xyz=xyz_text,
-        selected_atoms=default_selection,
-        height=int(height),
-        language=str(language),
-        key=key,
-        default=default_selection,
-    )
-    if not isinstance(value, list):
-        return default_selection
-
-    cleaned = []
-    for item in value:
-        try:
-            number = int(item)
-            if 1 <= number <= len(atoms):
-                cleaned.append(number)
-        except Exception:
-            pass
-    return sorted(set(cleaned))
+# =========================
+# Helper functions
+# =========================
+def get_texts():
+    lang = "ja" if st.session_state.ui_language == "日本語" else "en"
+    return lang, UI_TEXT[lang]
 
 
-def read_text(uploaded_file):
-    return uploaded_file.getvalue().decode("utf-8", errors="ignore")
-
-
-def extract_conf_id(filename: str):
-    m = re.search(r"(\d+)\.(log|out)$", filename, re.IGNORECASE)
-    if m:
-        return m.group(1)
-
-    m2 = re.search(r"conf[_\- ]*(\d+)", filename, re.IGNORECASE)
-    if m2:
-        return m2.group(1)
-
-    stem = re.sub(r"\.(log|out)$", "", filename, flags=re.IGNORECASE)
-    return stem
-
-
-def check_normal_termination(text: str):
-    return "Normal termination of Gaussian" in text
-
-
-def extract_gibbs_free_energy(text: str):
-    key = "Sum of electronic and thermal Free Energies="
-    for line in text.splitlines():
-        if key in line:
-            try:
-                return float(line.split("=")[-1].strip())
-            except Exception:
-                pass
-
-    key2 = "Sum of electronic and thermal Free Energies"
-    for line in text.splitlines():
-        if key2 in line:
-            try:
-                return float(line.split()[-1])
-            except Exception:
-                pass
-    return None
-
-
-def extract_last_scf_energy(text: str):
-    pattern = re.compile(r"SCF Done:\s+E\([RU]?[A-Za-z0-9]+\)\s*=\s*(-?\d+\.\d+)")
-    matches = pattern.findall(text)
-    if matches:
-        try:
-            return float(matches[-1])
-        except Exception:
-            return None
-    return None
-
-
-def extract_isotropic_shieldings(text: str):
-    pattern = re.compile(
-        r"^\s*(\d+)\s+([A-Z][a-z]?)\s+Isotropic\s*=\s*(-?\d+\.\d+)",
-        re.MULTILINE
-    )
-    rows = []
-    for m in pattern.finditer(text):
-        rows.append(
-            {
-                "atom_index": int(m.group(1)),
-                "element": m.group(2),
-                "shielding": float(m.group(3)),
-            }
+def check_obabel_available():
+    try:
+        result = subprocess.run(
+            ["obabel", "-H"],
+            capture_output=True,
+            text=True,
+            timeout=20
         )
-    return pd.DataFrame(rows)
+        if result.returncode == 0:
+            return True, "Open Babel detected."
+        return False, f"Open Babel returned non-zero exit status.\nSTDERR:\n{result.stderr}"
+    except FileNotFoundError:
+        return False, "Open Babel ('obabel') was not found."
+    except Exception as e:
+        return False, f"Failed to run obabel: {e}"
 
 
-def extract_last_xyz_from_gaussian(text: str):
-    lines = text.splitlines()
-    blocks = []
-
-    for i, line in enumerate(lines):
-        if "Standard orientation:" in line or "Input orientation:" in line:
-            start = i + 5
-            rows = []
-            j = start
-            while j < len(lines):
-                s = lines[j].strip()
-                if not s or s.startswith("-----"):
-                    break
-
-                parts = lines[j].split()
-                if len(parts) >= 6:
-                    try:
-                        atomic_num = int(parts[1])
-                        x = float(parts[3])
-                        y = float(parts[4])
-                        z = float(parts[5])
-                        rows.append((atomic_num, x, y, z))
-                    except Exception:
-                        pass
-                j += 1
-
-            if rows:
-                blocks.append(rows)
-
-    if not blocks:
-        return ""
-
-    last = blocks[-1]
-    xyz_lines = [str(len(last)), "Gaussian coordinates"]
-    for atomic_num, x, y, z in last:
-        symbol = ATOMIC_NUMBER_TO_SYMBOL.get(atomic_num, "X")
-        xyz_lines.append(f"{symbol} {x:.10f} {y:.10f} {z:.10f}")
-    return "\n".join(xyz_lines)
+def save_uploaded_file(uploaded_file, output_path: Path):
+    output_path.write_bytes(uploaded_file.getbuffer())
 
 
-def get_tms_reference_from_log(text):
-    df = extract_isotropic_shieldings(text)
+def parse_float(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
 
-    if df.empty:
-        return None, None, "No isotropic shielding entries were found in the TMS log."
-    if not check_normal_termination(text):
-        return None, None, "The TMS log did not terminate normally."
+    text = str(value).strip()
+    match = FLOAT_RE.search(text)
+    if not match:
+        return None
 
-    h_df = df[df["element"] == "H"].copy()
-    c_df = df[df["element"] == "C"].copy()
-
-    if h_df.empty:
-        return None, None, "No hydrogen shielding values were found in the TMS log."
-    if c_df.empty:
-        return None, None, "No carbon shielding values were found in the TMS log."
-
-    return h_df["shielding"].mean(), c_df["shielding"].mean(), None
-
-
-def boltzmann_weights(energies_hartree, temperature=298.15):
-    energies_hartree = np.array(energies_hartree, dtype=float)
-    rel_kcal = (energies_hartree - energies_hartree.min()) * HARTREE_TO_KCAL
-    weights = np.exp(-rel_kcal / (R_KCAL * temperature))
-    weights /= weights.sum()
-    return rel_kcal, weights
-
-
-def build_per_conformer_shielding_table(shielding_map, conf_ids):
-    merged = None
-    for cid in conf_ids:
-        df = shielding_map[cid].copy()
-        df = df.rename(columns={"shielding": f"shielding_{cid}"})
-        if merged is None:
-            merged = df
-        else:
-            merged = pd.merge(merged, df, on=["atom_index", "element"], how="outer")
-    return merged
-
-
-def add_boltzmann_average(per_conf_df, conf_ids, weights):
-    out = per_conf_df.copy()
-
-    for cid, w in zip(conf_ids, weights):
-        shielding_col = f"shielding_{cid}"
-        weighted_col = f"weighted_{cid}"
-        weight_col = f"weight_{cid}"
-
-        out[weighted_col] = out[shielding_col] * w
-        out[weight_col] = w
-
-    weighted_cols = [f"weighted_{cid}" for cid in conf_ids]
-    out["shielding_boltzmann"] = out[weighted_cols].sum(axis=1)
-    return out
-
-
-def shielding_to_shift(
-    df,
-    mode="manual_reference",
-    ref_H=31.5,
-    ref_C=185.0,
-    slope_H=1.0,
-    intercept_H=31.5,
-    slope_C=1.0,
-    intercept_C=185.0,
-):
-    out = df.copy()
-    shifts = []
-
-    for _, row in out.iterrows():
-        s = row["shielding_boltzmann"]
-        el = row["element"]
-
-        if mode in ["manual_reference", "tms_log"]:
-            if el == "H":
-                delta = ref_H - s
-            elif el == "C":
-                delta = ref_C - s
-            else:
-                delta = np.nan
-        elif mode == "linear":
-            if el == "H":
-                delta = intercept_H - slope_H * s
-            elif el == "C":
-                delta = intercept_C - slope_C * s
-            else:
-                delta = np.nan
-        else:
-            delta = np.nan
-
-        shifts.append(delta)
-
-    out["chemical_shift"] = shifts
-    return out
-
-
-def average_equivalent_atoms(df, mappings):
-    results = []
-
-    value_cols = [c for c in df.columns if c.startswith("shielding_") or c.startswith("weighted_") or c.startswith("weight_")]
-    if "shielding_boltzmann" in df.columns:
-        value_cols.append("shielding_boltzmann")
-    if "chemical_shift" in df.columns:
-        value_cols.append("chemical_shift")
-    value_cols = list(dict.fromkeys(value_cols))
-
-    for item in mappings:
-        atom_numbers = [int(n) for n in item.get("atom_numbers", [])]
-        sub = df[df["atom_index"].isin(atom_numbers)].copy()
-        if sub.empty:
-            continue
-
-        elements = sorted(sub["element"].dropna().unique().tolist())
-        element_label = "/".join(elements) if elements else ""
-
-        row = {
-            "group_label": item["label"],
-            "atom_indices": ",".join(map(str, atom_numbers)),
-            "n_atoms": len(atom_numbers),
-            "element": element_label,
-        }
-        for col in value_cols:
-            row[col] = sub[col].mean()
-
-        results.append(row)
-
-    if results:
-        return pd.DataFrame(results)
-
-    return pd.DataFrame(columns=["group_label", "atom_indices", "n_atoms", "element"])
-
-
-def dataframe_to_csv_bytes(df):
-    return df.to_csv(index=False).encode("utf-8")
-
-
-def atom_index_from_user_number(user_number: int):
-    return user_number - 1
+    try:
+        return float(match.group(0))
+    except Exception:
+        return None
 
 
 def sanitize_filename_part(text):
@@ -552,6 +317,7 @@ def sanitize_filename_part(text):
 def longest_common_prefix(strings):
     if not strings:
         return ""
+
     prefix = strings[0]
     for s in strings[1:]:
         i = 0
@@ -570,571 +336,782 @@ def clean_common_prefix(prefix):
     return prefix
 
 
-def build_output_prefix_from_giao(giao_files, min_prefix_len=3, fallback="output"):
-    stems = [sanitize_filename_part(f.name) for f in giao_files] if giao_files else []
+def build_output_prefix(uploaded_files, min_prefix_len=3, fallback="output"):
+    stems = [sanitize_filename_part(f.name) for f in uploaded_files]
 
     if not stems:
         return fallback
+
     if len(stems) == 1:
         return stems[0]
 
-    prefix = clean_common_prefix(longest_common_prefix(stems))
+    prefix = longest_common_prefix(stems)
+    prefix = clean_common_prefix(prefix)
+
     if len(prefix) >= min_prefix_len:
         return prefix
+
     return fallback
 
 
-def make_settings_json_bytes():
-    payload = {
-        "app": "Gaussian NMR Boltzmann Averaging App",
-        "version": APP_VERSION,
-        "atom_mappings": st.session_state.get("atom_mappings", []),
-    }
-    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+def extract_last_scf_energy(logfile: Path):
+    last = None
+    archive_last = None
+
+    with open(logfile, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            m = SCF_RE.search(line)
+            if m:
+                last = float(m.group(1))
+
+            for m2 in ARCHIVE_HF_RE.finditer(line):
+                archive_last = float(m2.group(1))
+
+    if last is not None:
+        return last
+    return archive_last
 
 
-def load_settings_json(uploaded_file):
-    text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
-    data = json.loads(text)
+def extract_gibbs_energy(logfile: Path):
+    found = None
+    with open(logfile, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if GIBBS_KEY in line:
+                try:
+                    found = float(line.split()[-1])
+                except Exception:
+                    pass
+    return found
 
-    mappings = data.get("atom_mappings", [])
-    if not isinstance(mappings, list):
-        raise ValueError("atom_mappings is not a list.")
 
-    normalized = []
-    for item in mappings:
-        if not isinstance(item, dict):
-            continue
-        label = str(item.get("label", "")).strip()
-        atom_numbers = sorted(set(int(x) for x in item.get("atom_numbers", [])))
-        atom_indices = [atom_index_from_user_number(n) for n in atom_numbers]
-        if label and atom_numbers:
-            normalized.append(
-                {
-                    "label": label,
-                    "atom_numbers": atom_numbers,
-                    "atom_indices": atom_indices,
-                }
+def check_normal_termination(logfile: Path):
+    found = False
+    with open(logfile, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if NORMAL_TERM_KEY in line:
+                found = True
+    return found
+
+
+def convert_log_to_sdf(log_path: Path, sdf_path: Path):
+    try:
+        result = subprocess.run(
+            ["obabel", str(log_path), "-O", str(sdf_path)],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+        success = (result.returncode == 0) and sdf_path.exists() and sdf_path.stat().st_size > 0
+        return success, result.stdout, result.stderr
+    except Exception as e:
+        return False, "", str(e)
+
+
+def read_first_mol_from_sdf(sdf_path: Path):
+    try:
+        suppl = Chem.SDMolSupplier(str(sdf_path), removeHs=False)
+        mols = [m for m in suppl if m is not None]
+        if not mols:
+            return None
+        return mols[0]
+    except Exception:
+        return None
+
+
+def read_all_mols_from_sdf(sdf_path: Path):
+    mols = []
+    try:
+        suppl = Chem.SDMolSupplier(str(sdf_path), removeHs=False)
+        for mol in suppl:
+            if mol is not None:
+                mols.append(mol)
+    except Exception:
+        return []
+    return mols
+
+
+def find_prop_name_case_insensitive(prop_dict, target_name):
+    target_lower = target_name.strip().lower()
+    for name in prop_dict:
+        if name.lower() == target_lower:
+            return name
+    return None
+
+
+def collect_numeric_props(mol):
+    numeric_props = {}
+    for name in mol.GetPropNames():
+        value = parse_float(mol.GetProp(name))
+        if value is not None:
+            numeric_props[name] = value
+    return numeric_props
+
+
+def extract_energy_from_sdf_mol(mol, mode="auto", manual_property_name=""):
+    numeric_props = collect_numeric_props(mol)
+
+    if not numeric_props:
+        return None, None, "energy_not_found"
+
+    if mode == "manual":
+        if not manual_property_name.strip():
+            return None, None, "manual_property_not_found"
+
+        matched_name = find_prop_name_case_insensitive(numeric_props, manual_property_name)
+        if matched_name is None:
+            return None, None, "manual_property_not_found"
+        return numeric_props[matched_name], matched_name, "ok"
+
+    for candidate in COMMON_SDF_ENERGY_PROPS:
+        matched_name = find_prop_name_case_insensitive(numeric_props, candidate)
+        if matched_name is not None:
+            return numeric_props[matched_name], matched_name, "ok"
+
+    keyword_priority = [
+        "free",
+        "gibbs",
+        "energy",
+        "scf",
+        "mmff",
+        "conflex",
+        "forcefield",
+        "enthalpy",
+    ]
+
+    scored = []
+    for name, value in numeric_props.items():
+        lname = name.lower()
+        score = sum(1 for kw in keyword_priority if kw in lname)
+        if score > 0:
+            scored.append((score, name, value))
+
+    if scored:
+        scored.sort(key=lambda x: (-x[0], x[1].lower()))
+        _, best_name, best_value = scored[0]
+        return best_value, best_name, "ok"
+
+    if len(numeric_props) == 1:
+        only_name = next(iter(numeric_props))
+        return numeric_props[only_name], only_name, "ok"
+
+    return None, None, "energy_not_found"
+
+
+def annotate_mol(
+    mol,
+    source_file,
+    source_label,
+    input_type,
+    record_index,
+    energy_value,
+    energy_type,
+    energy_unit,
+    energy_source,
+    normal_termination
+):
+    mol.SetProp(APP_SOURCE_FILE_PROP, str(source_file))
+    mol.SetProp(APP_SOURCE_LABEL_PROP, str(source_label))
+    mol.SetProp(APP_INPUT_TYPE_PROP, str(input_type))
+    mol.SetProp(APP_RECORD_INDEX_PROP, str(record_index))
+    mol.SetProp(APP_ENERGY_TYPE_PROP, str(energy_type))
+    mol.SetProp(APP_ENERGY_UNIT_PROP, str(energy_unit))
+    mol.SetProp(APP_ENERGY_SOURCE_PROP, str(energy_source))
+    mol.SetProp(APP_NORMAL_TERM_PROP, str(normal_termination))
+
+    if energy_value is not None:
+        mol.SetProp(APP_ENERGY_PROP, str(energy_value))
+
+
+def get_energy(mol):
+    if mol.HasProp(APP_ENERGY_PROP):
+        return parse_float(mol.GetProp(APP_ENERGY_PROP))
+    return None
+
+
+def get_prop_or_blank(mol, prop_name):
+    return mol.GetProp(prop_name) if mol.HasProp(prop_name) else ""
+
+
+def write_sdf_bytes(mols):
+    sio = io.StringIO()
+    writer = Chem.SDWriter(sio)
+    for mol in mols:
+        writer.write(mol)
+    writer.close()
+    return sio.getvalue().encode("utf-8")
+
+
+def calculate_rmsd(mol_a, mol_b, method="GetBestRMS", remove_hs_for_rmsd=True):
+    try:
+        a = Chem.RemoveHs(mol_a) if remove_hs_for_rmsd else mol_a
+        b = Chem.RemoveHs(mol_b) if remove_hs_for_rmsd else mol_b
+
+        if method == "AlignMol":
+            rmsd = AllChem.AlignMol(a, b)
+        else:
+            rmsd = AllChem.GetBestRMS(a, b)
+        return rmsd
+    except Exception:
+        return None
+
+
+def convert_relative_energy_to_kcal(delta_value, unit):
+    unit = (unit or "").strip().lower()
+
+    if unit == "hartree":
+        return delta_value * ENERGY_HARTREE_TO_KCAL
+    if unit == "kcal/mol":
+        return delta_value
+    if unit == "kj/mol":
+        return delta_value * ENERGY_KJ_TO_KCAL
+
+    return None
+
+
+def deduplicate_molecules(
+    mols,
+    rmsd_cutoff=0.20,
+    remove_hs_for_rmsd=True,
+    rmsd_method="GetBestRMS"
+):
+    prepared = []
+    for idx, mol in enumerate(mols, start=1):
+        energy = get_energy(mol)
+        source_file = get_prop_or_blank(mol, APP_SOURCE_FILE_PROP)
+        source_label = get_prop_or_blank(mol, APP_SOURCE_LABEL_PROP) or f"mol_{idx}"
+        input_type = get_prop_or_blank(mol, APP_INPUT_TYPE_PROP)
+        record_index = get_prop_or_blank(mol, APP_RECORD_INDEX_PROP)
+        energy_type = get_prop_or_blank(mol, APP_ENERGY_TYPE_PROP)
+        energy_unit = get_prop_or_blank(mol, APP_ENERGY_UNIT_PROP)
+        energy_source = get_prop_or_blank(mol, APP_ENERGY_SOURCE_PROP)
+        normal_term = get_prop_or_blank(mol, APP_NORMAL_TERM_PROP)
+
+        prepared.append({
+            "mol": mol,
+            "energy": energy,
+            "source_file": source_file,
+            "source_label": source_label,
+            "input_type": input_type,
+            "record_index": record_index,
+            "energy_type": energy_type,
+            "energy_unit": energy_unit,
+            "energy_source": energy_source,
+            "normal_termination": normal_term,
+        })
+
+    valid = [x for x in prepared if x["energy"] is not None]
+    invalid = [x for x in prepared if x["energy"] is None]
+
+    valid.sort(key=lambda x: x["energy"])
+
+    kept_mols = []
+    kept_info = []
+    summary_rows = []
+
+    for rank, item in enumerate(valid, start=1):
+        mol = item["mol"]
+
+        is_dup = False
+        duplicate_of = ""
+        best_rmsd = None
+
+        for kept_item in kept_info:
+            rmsd = calculate_rmsd(
+                mol,
+                kept_item["mol"],
+                method=rmsd_method,
+                remove_hs_for_rmsd=remove_hs_for_rmsd
             )
-    return normalized
+
+            if rmsd is not None and rmsd < rmsd_cutoff:
+                is_dup = True
+                duplicate_of = kept_item["source_label"]
+                best_rmsd = rmsd
+                break
+
+        if not is_dup:
+            kept_mols.append(mol)
+            kept_info.append(item)
+
+        summary_rows.append({
+            "source_label": item["source_label"],
+            "source_file": item["source_file"],
+            "input_type": item["input_type"],
+            "record_index": item["record_index"],
+            "energy_type": item["energy_type"],
+            "energy_property": item["energy_source"],
+            "energy_unit": item["energy_unit"],
+            "energy_value": item["energy"],
+            "relative_energy_kcal_mol": None,
+            "rank_by_energy": rank,
+            "status": "removed_as_duplicate" if is_dup else "kept",
+            "duplicate_of": duplicate_of,
+            "rmsd_to_representative": best_rmsd,
+            "normal_termination": item["normal_termination"],
+        })
+
+    for item in invalid:
+        summary_rows.append({
+            "source_label": item["source_label"],
+            "source_file": item["source_file"],
+            "input_type": item["input_type"],
+            "record_index": item["record_index"],
+            "energy_type": item["energy_type"],
+            "energy_property": item["energy_source"],
+            "energy_unit": item["energy_unit"],
+            "energy_value": None,
+            "relative_energy_kcal_mol": None,
+            "rank_by_energy": None,
+            "status": "energy_not_found",
+            "duplicate_of": "",
+            "rmsd_to_representative": None,
+            "normal_termination": item["normal_termination"],
+        })
+
+    valid_units = {row["energy_unit"] for row in summary_rows if row["energy_value"] is not None}
+    if len(valid_units) == 1:
+        unit = next(iter(valid_units))
+        valid_energies = [row["energy_value"] for row in summary_rows if row["energy_value"] is not None]
+        if valid_energies:
+            e0 = min(valid_energies)
+            for row in summary_rows:
+                if row["energy_value"] is not None:
+                    delta = row["energy_value"] - e0
+                    row["relative_energy_kcal_mol"] = convert_relative_energy_to_kcal(delta, unit)
+
+    return kept_mols, summary_rows
 
 
+def make_summary_csv_bytes(summary_rows):
+    df = pd.DataFrame(summary_rows)
+    csv_text = df.to_csv(index=False)
+    return df, csv_text.encode("utf-8")
+
+
+def localize_status(value, texts):
+    mapping = {
+        "kept": texts["status_kept"],
+        "removed_as_duplicate": texts["status_removed_as_duplicate"],
+        "energy_not_found": texts["status_energy_not_found"],
+        "conversion_failed": texts["status_conversion_failed"],
+        "rdkit_read_failed": texts["status_rdkit_read_failed"],
+        "unsupported_file_type": texts["status_unsupported_file_type"],
+        "manual_property_not_found": texts["status_manual_property_not_found"],
+    }
+    return mapping.get(value, value)
+
+
+def make_display_df(raw_df, lang, texts):
+    if raw_df is None or raw_df.empty:
+        return raw_df
+
+    df = raw_df.copy()
+
+    if "status" in df.columns:
+        df["status"] = df["status"].map(lambda x: localize_status(x, texts))
+
+    rename_map = COLUMN_LABELS[lang]
+    df = df.rename(columns=rename_map)
+    return df
+
+
+def render_results(payload, lang, texts):
+    st.subheader(texts["results"])
+
+    if payload.get("mixed_input_types", False):
+        st.warning(texts["mixed_input_warning"])
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric(texts["uploaded_files_metric"], payload["uploaded_count"])
+    col2.metric(texts["loaded_conformers_metric"], payload["loaded_count"])
+    col3.metric(texts["kept_structures_metric"], payload["kept_count"])
+
+    st.subheader(texts["summary_table"])
+    st.dataframe(make_display_df(payload["summary_df"], lang, texts), use_container_width=True)
+
+    st.subheader(texts["download_outputs"])
+    d1, d2, d3 = st.columns(3)
+
+    output_prefix = payload.get("output_prefix", "output")
+
+    d1.download_button(
+        label=texts["download_all"],
+        data=payload["all_sdf_bytes"],
+        file_name=f"{output_prefix}_all_conformers.sdf",
+        mime="chemical/x-mdl-sdfile"
+    )
+
+    d2.download_button(
+        label=texts["download_unique"],
+        data=payload["unique_sdf_bytes"],
+        file_name=f"{output_prefix}_unique_conformers.sdf",
+        mime="chemical/x-mdl-sdfile"
+    )
+
+    d3.download_button(
+        label=texts["download_summary"],
+        data=payload["summary_csv_bytes"],
+        file_name=f"{output_prefix}_summary.csv",
+        mime="text/csv"
+    )
+
+    with st.expander(texts["show_details"]):
+        details_df = payload.get("processing_logs_df")
+        if details_df is not None and not details_df.empty:
+            st.dataframe(make_display_df(details_df, lang, texts), use_container_width=True)
+        else:
+            st.write(texts["no_details"])
+
+
+# =========================
+# Sidebar: language selector
+# =========================
 with st.sidebar:
     selected_language = st.selectbox(
         "Language / 言語",
         options=["English", "日本語"],
-        index=0 if st.session_state["ui_language"] == "English" else 1,
+        index=0 if st.session_state.ui_language == "English" else 1,
     )
-    st.session_state["ui_language"] = selected_language
+    st.session_state.ui_language = selected_language
 
-st.title(t("title"))
-st.caption(t("caption"))
-st.write(t("description"))
+lang, texts = get_texts()
 
-st.sidebar.header(t("settings"))
-with st.sidebar.expander(t("developer_info"), expanded=False):
-    st.sidebar.write(f'**{t("developer_name")}**: {DEVELOPER_INFO["name"]}')
-    if current_language() == "ja":
-        st.sidebar.write(f'**{t("developer_affiliation")}**: {DEVELOPER_INFO["affiliation_ja"]}')
-    else:
-        st.sidebar.write(f'**{t("developer_affiliation")}**: {DEVELOPER_INFO["affiliation_en"]}')
+# =========================
+# Main header
+# =========================
+st.title(texts["title"])
+st.caption(texts["caption"])
+st.write(texts["description"])
+st.info(texts["info"])
 
-temperature = st.sidebar.number_input(t("temperature"), value=298.15, step=1.0)
+# =========================
+# Sidebar settings
+# =========================
+with st.sidebar:
+    st.header(texts["settings"])
 
-energy_mode = st.sidebar.radio(
-    t("energy_mode"),
-    [t("energy_gibbs"), t("energy_scf")],
-    index=0,
-)
-
-shift_mode = st.sidebar.radio(
-    t("shift_mode"),
-    [t("shift_manual"), t("shift_tms"), t("shift_linear")],
-    index=0,
-)
-
-ref_H = None
-ref_C = None
-slope_H = None
-intercept_H = None
-slope_C = None
-intercept_C = None
-
-if shift_mode == t("shift_manual"):
-    ref_H = st.sidebar.number_input(t("ref_h"), value=31.5)
-    ref_C = st.sidebar.number_input(t("ref_c"), value=185.0)
-
-elif shift_mode == t("shift_tms"):
-    tms_file = st.sidebar.file_uploader(
-        t("upload_tms"),
-        type=["log", "out"],
-        accept_multiple_files=False,
-        key="tms_log",
-    )
-
-    if tms_file is not None:
-        tms_text = read_text(tms_file)
-        parsed_ref_H, parsed_ref_C, tms_error = get_tms_reference_from_log(tms_text)
-
-        if tms_error:
-            st.session_state["tms_ref_H"] = None
-            st.session_state["tms_ref_C"] = None
-            st.session_state["tms_ref_filename"] = None
-            st.sidebar.error(tms_error)
+    with st.expander(texts["developer_info"], expanded=False):
+        st.write(f"**{texts['developer_name']}**: {DEVELOPER_INFO['name']}")
+        if lang == "ja":
+            st.write(f"**{texts['developer_affiliation']}**: {DEVELOPER_INFO['affiliation_ja']}")
         else:
-            st.session_state["tms_ref_H"] = parsed_ref_H
-            st.session_state["tms_ref_C"] = parsed_ref_C
-            st.session_state["tms_ref_filename"] = tms_file.name
-            st.sidebar.success(t("tms_success"))
-            st.sidebar.write(f'{t("tms_file")}: {tms_file.name}')
-            st.sidebar.write(f'{t("tms_h")}: {parsed_ref_H:.4f}')
-            st.sidebar.write(f'{t("tms_c")}: {parsed_ref_C:.4f}')
+            st.write(f"**{texts['developer_affiliation']}**: {DEVELOPER_INFO['affiliation_en']}")
 
-    elif st.session_state["tms_ref_H"] is not None and st.session_state["tms_ref_C"] is not None:
-        st.sidebar.success(t("tms_prev"))
-        if st.session_state["tms_ref_filename"]:
-            st.sidebar.write(f'{t("tms_file")}: {st.session_state["tms_ref_filename"]}')
-        st.sidebar.write(f'{t("tms_h")}: {st.session_state["tms_ref_H"]:.4f}')
-        st.sidebar.write(f'{t("tms_c")}: {st.session_state["tms_ref_C"]:.4f}')
+    st.subheader(texts["log_energy_header"])
+    energy_type_ui = st.radio(
+        texts["energy_to_extract"],
+        options=[texts["scf"], texts["free_energy"]],
+        index=0,
+    )
+    log_energy_type_label = "SCF" if energy_type_ui == texts["scf"] else "Free Energy"
+
+    st.subheader(texts["sdf_energy_header"])
+    sdf_energy_mode_ui = st.radio(
+        texts["sdf_energy_mode"],
+        options=[texts["auto_detect"], texts["manual_property"]],
+        index=0,
+    )
+    sdf_energy_mode = "auto" if sdf_energy_mode_ui == texts["auto_detect"] else "manual"
+
+    sdf_manual_property_name = ""
+    if sdf_energy_mode == "manual":
+        sdf_manual_property_name = st.text_input(
+            texts["sdf_property_name"],
+            value="Energy",
+            help=texts["sdf_property_hint"],
+        )
+
+    sdf_energy_unit_ui = st.selectbox(
+        texts["sdf_energy_unit"],
+        options=[texts["kcal_mol"], texts["hartree"], texts["kj_mol"], texts["unknown_unit"]],
+        index=0,
+    )
+    sdf_energy_unit_map = {
+        texts["hartree"]: "Hartree",
+        texts["kcal_mol"]: "kcal/mol",
+        texts["kj_mol"]: "kJ/mol",
+        texts["unknown_unit"]: "Unknown",
+    }
+    sdf_energy_unit = sdf_energy_unit_map[sdf_energy_unit_ui]
+
+    st.subheader(texts["symmetry_header"])
+    symmetry_mode = st.radio(
+        texts["symmetry_handling"],
+        options=[
+            texts["symmetric_present"],
+            texts["no_symmetric_concern"],
+        ],
+        index=0,
+    )
+
+    if symmetry_mode == texts["symmetric_present"]:
+        rmsd_method = "GetBestRMS"
+        st.caption(texts["rmsd_getbestrms"])
     else:
-        st.sidebar.info(t("tms_prompt"))
+        rmsd_method = "AlignMol"
+        st.caption(texts["rmsd_alignmol"])
 
-    ref_H = st.session_state["tms_ref_H"]
-    ref_C = st.session_state["tms_ref_C"]
-
-elif shift_mode == t("shift_linear"):
-    slope_H = st.sidebar.number_input(t("slope_h"), value=1.0)
-    intercept_H = st.sidebar.number_input(t("intercept_h"), value=31.5)
-    slope_C = st.sidebar.number_input(t("slope_c"), value=1.0)
-    intercept_C = st.sidebar.number_input(t("intercept_c"), value=185.0)
-
-element_filter = st.sidebar.selectbox(
-    t("element_filter"),
-    [t("all"), t("h"), t("c"), t("other")],
-    index=0,
-)
-
-st.subheader(t("upload_header"))
-
-opt_files = st.file_uploader(
-    t("upload_opt"),
-    type=["log", "out"],
-    accept_multiple_files=True,
-    key="opt_files",
-)
-
-giao_files = st.file_uploader(
-    t("upload_giao"),
-    type=["log", "out"],
-    accept_multiple_files=True,
-    key="giao_files",
-)
-
-result_df = None
-per_conf_df = None
-valid_df = None
-eq_df = None
-output_prefix = build_output_prefix_from_giao(giao_files)
-
-if giao_files:
-    st.caption(t("filename_prefix_info"))
-
-st.subheader(t("settings_io_header"))
-st.caption(t("save_project_desc"))
-col_set1, col_set2, col_set3 = st.columns([2, 2, 1])
-
-with col_set1:
-    st.download_button(
-        label=t("download_settings"),
-        data=make_settings_json_bytes(),
-        file_name=f"{output_prefix}_nmr_mapping_settings.json",
-        mime="application/json",
+    rmsd_cutoff = st.number_input(
+        texts["rmsd_cutoff"],
+        min_value=0.01,
+        max_value=10.00,
+        value=0.20,
+        step=0.01,
+        format="%.2f",
+        help=texts["rmsd_cutoff_help"]
     )
 
-with col_set2:
-    settings_file = st.file_uploader(
-        t("upload_settings"),
-        type=["json"],
-        accept_multiple_files=False,
-        key="settings_json",
+    remove_hs_for_rmsd = st.checkbox(
+        texts["heavy_atom_rmsd"],
+        value=True
     )
-    if settings_file is not None and not st.session_state["settings_loaded_once"]:
-        try:
-            mappings_loaded = load_settings_json(settings_file)
-            st.session_state["atom_mappings"] = mappings_loaded
-            st.session_state["settings_loaded_once"] = True
-            st.success(t("settings_loaded"))
-            st.rerun()
-        except Exception:
-            st.error(t("settings_load_error"))
-    if settings_file is None:
-        st.session_state["settings_loaded_once"] = False
 
-with col_set3:
-    if st.button(t("clear_mappings")):
-        st.session_state["atom_mappings"] = []
-        st.session_state["mapping_selection"] = []
+    if st.button(texts["clear_results"]):
+        st.session_state.results_ready = False
+        st.session_state.result_payload = None
         st.rerun()
 
-if opt_files and giao_files:
-    opt_records = []
-    for f in opt_files:
-        text = read_text(f)
-        cid = extract_conf_id(f.name)
-        gibbs = extract_gibbs_free_energy(text)
-        scf = extract_last_scf_energy(text)
-        normal = check_normal_termination(text)
-        xyz_text = extract_last_xyz_from_gaussian(text)
+# =========================
+# Main UI
+# =========================
+uploaded_files = st.file_uploader(
+    texts["upload_files"],
+    type=["log", "sdf"],
+    accept_multiple_files=True
+)
 
-        opt_records.append(
-            {
-                "conf_id": cid,
-                "opt_filename": f.name,
-                "gibbs_hartree": gibbs,
-                "scf_hartree": scf,
-                "opt_normal_termination": normal,
-                "xyz_text": xyz_text,
-            }
-        )
+run_button = st.button(texts["run_button"], type="primary")
 
-    opt_df = pd.DataFrame(opt_records)
-
-    giao_records = []
-    shielding_map = {}
-
-    for f in giao_files:
-        text = read_text(f)
-        cid = extract_conf_id(f.name)
-        normal = check_normal_termination(text)
-        shielding_df = extract_isotropic_shieldings(text)
-        xyz_text = extract_last_xyz_from_gaussian(text)
-
-        giao_records.append(
-            {
-                "conf_id": cid,
-                "giao_filename": f.name,
-                "n_atoms_found": len(shielding_df),
-                "giao_normal_termination": normal,
-                "giao_xyz_text": xyz_text,
-            }
-        )
-
-        shielding_map[cid] = shielding_df
-
-    giao_df = pd.DataFrame(giao_records)
-    pair_df = pd.merge(opt_df, giao_df, on="conf_id", how="inner")
-
-    if energy_mode == t("energy_gibbs"):
-        energy_col = "gibbs_hartree"
-    else:
-        energy_col = "scf_hartree"
-
-    valid_df = pair_df[
-        pair_df["conf_id"].notna()
-        & pair_df[energy_col].notna()
-        & pair_df["opt_normal_termination"]
-        & pair_df["giao_normal_termination"]
-        & (pair_df["n_atoms_found"] > 0)
-    ].copy()
-
-    if len(valid_df) == 0:
-        st.error(t("no_valid"))
+# =========================
+# Run
+# =========================
+if run_button:
+    if not uploaded_files:
+        st.error(texts["need_file"])
         st.stop()
 
-    tms_ready = True
-    if shift_mode == t("shift_tms") and (ref_H is None or ref_C is None):
-        tms_ready = False
-        st.warning(t("tms_not_ready"))
+    output_prefix = build_output_prefix(uploaded_files)
 
-    rel_kcal, weights = boltzmann_weights(valid_df[energy_col].values, temperature=temperature)
-    valid_df["energy_used_hartree"] = valid_df[energy_col]
-    valid_df["relative_energy_kcal"] = rel_kcal
-    valid_df["boltzmann_weight"] = weights
+    needs_obabel = any(Path(f.name).suffix.lower() == ".log" for f in uploaded_files)
+    if needs_obabel:
+        obabel_ok, obabel_msg = check_obabel_available()
+        if not obabel_ok:
+            st.error(texts["obabel_not_available"])
+            st.code(obabel_msg)
+            st.stop()
+        st.success(obabel_msg)
 
-    conf_ids = valid_df["conf_id"].tolist()
-    per_conf_df_full = build_per_conformer_shielding_table(shielding_map, conf_ids)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        loaded_mols = []
+        processing_logs = []
 
-    atom_table_full = (
-        per_conf_df_full[["atom_index", "element"]]
-        .drop_duplicates()
-        .sort_values("atom_index")
-        .reset_index(drop=True)
-    )
-    st.session_state["latest_atom_table"] = atom_table_full.copy()
+        progress = st.progress(0)
+        status_box = st.empty()
 
-    valid_xyz = ""
-    for _, row in valid_df.iterrows():
-        if isinstance(row.get("xyz_text"), str) and row.get("xyz_text").strip():
-            valid_xyz = row["xyz_text"]
-            break
-        if isinstance(row.get("giao_xyz_text"), str) and row.get("giao_xyz_text").strip():
-            valid_xyz = row["giao_xyz_text"]
-            break
-    st.session_state["latest_xyz"] = valid_xyz
+        total_files = len(uploaded_files)
+        input_types_seen = set()
 
-    per_conf_df = per_conf_df_full.copy()
-    if element_filter == t("h"):
-        per_conf_df = per_conf_df[per_conf_df["element"] == "H"].copy()
-    elif element_filter == t("c"):
-        per_conf_df = per_conf_df[per_conf_df["element"] == "C"].copy()
-    elif element_filter == t("other"):
-        per_conf_df = per_conf_df[~per_conf_df["element"].isin(["H", "C"])].copy()
+        for i, uploaded_file in enumerate(uploaded_files, start=1):
+            status_box.write(f"{texts['processing']} {i}/{total_files}: `{uploaded_file.name}`")
 
-    avg_df = add_boltzmann_average(per_conf_df, conf_ids, weights)
+            suffix = Path(uploaded_file.name).suffix.lower()
+            file_path = tmpdir / uploaded_file.name
+            save_uploaded_file(uploaded_file, file_path)
 
-    if shift_mode == t("shift_manual"):
-        result_df = shielding_to_shift(
-            avg_df,
-            mode="manual_reference",
-            ref_H=ref_H,
-            ref_C=ref_C,
-        )
-    elif shift_mode == t("shift_tms"):
-        if tms_ready:
-            result_df = shielding_to_shift(
-                avg_df,
-                mode="tms_log",
-                ref_H=ref_H,
-                ref_C=ref_C,
-            )
-        else:
-            result_df = avg_df.copy()
-            result_df["chemical_shift"] = np.nan
-    else:
-        result_df = shielding_to_shift(
-            avg_df,
-            mode="linear",
-            slope_H=slope_H,
-            intercept_H=intercept_H,
-            slope_C=slope_C,
-            intercept_C=intercept_C,
-        )
+            if suffix == ".log":
+                input_types_seen.add("log")
 
-    with st.expander(t("matched_header"), expanded=False):
-        st.dataframe(pair_df, use_container_width=True)
+                normal_term = check_normal_termination(file_path)
+                energy_value = extract_last_scf_energy(file_path) if log_energy_type_label == "SCF" else extract_gibbs_energy(file_path)
 
-    with st.expander(t("weights_header"), expanded=False):
-        st.dataframe(valid_df, use_container_width=True)
+                sdf_path = tmpdir / f"{file_path.stem}.sdf"
+                conv_success, conv_stdout, conv_stderr = convert_log_to_sdf(file_path, sdf_path)
 
-    with st.expander(t("shielding_header"), expanded=False):
-        st.dataframe(per_conf_df, use_container_width=True)
-
-    with st.expander(t("avg_header"), expanded=False):
-        st.caption(t("summary_columns_note"))
-        st.dataframe(result_df, use_container_width=True)
-
-st.subheader(t("mapping_header"))
-st.write(t("mapping_desc"))
-
-atom_df_ui = st.session_state["latest_atom_table"].copy()
-
-if atom_df_ui.empty:
-    st.info(t("coord_not_found"))
-else:
-    current_selection = st.session_state.get("mapping_selection", [])
-
-    left, right = st.columns([1.55, 1.0], gap="large")
-
-    with left:
-        st.markdown(t("click_atoms"))
-        picked_atoms = atom_picker(
-            atom_df_ui["element"].tolist(),
-            st.session_state["latest_xyz"],
-            selected_atoms=current_selection,
-            language=current_language(),
-            key="nmr_atom_picker",
-        )
-        st.session_state["mapping_selection"] = picked_atoms
-        current_selection = picked_atoms
-        st.caption(t("viewer_caption"))
-
-    with right:
-        st.markdown(t("new_mapping"))
-
-        if current_selection:
-            selected_details = [
-                f'{atom_df_ui.loc[atom_df_ui["atom_index"] == number, "element"].iloc[0]} {number}'
-                for number in current_selection
-                if number in atom_df_ui["atom_index"].tolist()
-            ]
-            st.success(t("selected", items=", ".join(selected_details)))
-        else:
-            st.info(t("none_selected"))
-
-        label_mode = st.radio(
-            t("label_entry"),
-            [t("build_label"), t("free_text")],
-            horizontal=True,
-            key="nmr_label_mode",
-        )
-
-        if label_mode == t("build_label"):
-            label_col1, label_col2 = st.columns([1.2, 1.0])
-            position = label_col1.text_input(
-                t("position_number"),
-                value="",
-                placeholder=t("position_placeholder"),
-                key="nmr_position",
-            ).strip()
-            prime = label_col2.selectbox(
-                t("prime"),
-                ["", "′", "″", "‴"],
-                key="nmr_prime",
-            )
-            proposed_label = f"H-{position}{prime}" if position else ""
-            if proposed_label:
-                st.markdown(t("display_label", label=proposed_label))
-        else:
-            proposed_label = st.text_input(
-                t("label"),
-                value="",
-                placeholder=t("label_placeholder"),
-                key="nmr_custom_label",
-            ).strip()
-
-        button_col1, button_col2 = st.columns(2)
-        save_mapping = button_col1.button(
-            t("save_mapping"),
-            type="primary",
-            use_container_width=True,
-            key="nmr_save_mapping",
-        )
-        clear_selection = button_col2.button(
-            t("clear_selection"),
-            use_container_width=True,
-            key="nmr_clear_selection",
-        )
-
-        if clear_selection:
-            st.session_state["mapping_selection"] = []
-            st.rerun()
-
-        if save_mapping:
-            if not proposed_label:
-                st.error(t("enter_label"))
-            elif not current_selection:
-                st.error(t("select_atom"))
-            else:
-                non_h = [
-                    n for n in current_selection
-                    if atom_df_ui.loc[atom_df_ui["atom_index"] == n, "element"].iloc[0] != "H"
-                ]
-                if non_h:
-                    st.error(t("non_hydrogen", atoms=", ".join(map(str, non_h))))
-                else:
-                    atom_indices = [atom_index_from_user_number(n) for n in current_selection]
-                    existing = next(
-                        (item for item in st.session_state["atom_mappings"] if item["label"] == proposed_label),
-                        None,
-                    )
-                    if existing is None:
-                        st.session_state["atom_mappings"].append(
-                            {
-                                "label": proposed_label,
-                                "atom_numbers": list(current_selection),
-                                "atom_indices": atom_indices,
-                            }
-                        )
-                        st.success(t("added", label=proposed_label))
-                    else:
-                        existing["atom_numbers"] = list(current_selection)
-                        existing["atom_indices"] = atom_indices
-                        st.success(t("updated", label=proposed_label))
-                    st.session_state["mapping_selection"] = []
-                    st.rerun()
-
-        with st.expander(t("manual_fallback")):
-            st.caption(t("manual_desc"))
-            manual_raw = st.text_input(
-                t("manual_numbers"),
-                value=",".join(map(str, current_selection)),
-                key="nmr_manual_selection",
-            )
-            if st.button(t("apply_manual"), key="nmr_apply_manual"):
-                try:
-                    manual_numbers = sorted({
-                        int(x.strip())
-                        for x in manual_raw.split(",")
-                        if x.strip()
+                if not conv_success:
+                    processing_logs.append({
+                        "source_label": uploaded_file.name,
+                        "source_file": uploaded_file.name,
+                        "input_type": "log",
+                        "record_index": 1,
+                        "energy_type": log_energy_type_label,
+                        "energy_property": "",
+                        "energy_unit": "Hartree",
+                        "energy_value": energy_value,
+                        "relative_energy_kcal_mol": None,
+                        "rank_by_energy": None,
+                        "status": "conversion_failed",
+                        "duplicate_of": "",
+                        "rmsd_to_representative": None,
+                        "normal_termination": normal_term,
                     })
-                    invalid = [n for n in manual_numbers if n < 1 or n > len(atom_df_ui)]
-                    if invalid:
-                        st.error(t("out_of_range", atoms=", ".join(map(str, invalid))))
-                    else:
-                        st.session_state["mapping_selection"] = manual_numbers
-                        st.rerun()
-                except ValueError:
-                    st.error(t("integer_error"))
+                    progress.progress(i / total_files)
+                    continue
 
-    st.markdown(t("registered_mappings"))
-    if not st.session_state["atom_mappings"]:
-        st.info(t("no_mappings"))
-    else:
-        for idx, item in enumerate(list(st.session_state["atom_mappings"])):
-            with st.container(border=True):
-                info_col, select_col, delete_col = st.columns([4.5, 1.5, 1.0])
-                atom_numbers = [int(n) for n in item.get("atom_numbers", [])]
-                atom_text = ", ".join(str(n) for n in atom_numbers) if atom_numbers else t("not_assigned")
-                info_col.markdown(f'**{item["label"]}**  \n{t("atoms_label")}: {atom_text}')
-                if select_col.button(
-                    t("show_edit"),
-                    key=f"show_mapping_{idx}",
-                    use_container_width=True,
-                ):
-                    st.session_state["mapping_selection"] = list(item["atom_numbers"])
-                    st.rerun()
-                if delete_col.button(
-                    t("delete"),
-                    key=f"delete_mapping_{idx}",
-                    use_container_width=True,
-                ):
-                    st.session_state["atom_mappings"].pop(idx)
-                    st.rerun()
+                mol = read_first_mol_from_sdf(sdf_path)
+                if mol is None:
+                    processing_logs.append({
+                        "source_label": uploaded_file.name,
+                        "source_file": uploaded_file.name,
+                        "input_type": "log",
+                        "record_index": 1,
+                        "energy_type": log_energy_type_label,
+                        "energy_property": "",
+                        "energy_unit": "Hartree",
+                        "energy_value": energy_value,
+                        "relative_energy_kcal_mol": None,
+                        "rank_by_energy": None,
+                        "status": "rdkit_read_failed",
+                        "duplicate_of": "",
+                        "rmsd_to_representative": None,
+                        "normal_termination": normal_term,
+                    })
+                    progress.progress(i / total_files)
+                    continue
 
-    with st.expander(t("mapping_status"), expanded=False):
-        status_df = pd.DataFrame([
-            {
-                t("mapping_registered"): len(st.session_state["atom_mappings"]),
-                t("mapping_labels"): ", ".join(item["label"] for item in st.session_state["atom_mappings"]),
-            }
-        ])
-        st.dataframe(status_df, use_container_width=True, hide_index=True)
+                annotate_mol(
+                    mol=mol,
+                    source_file=uploaded_file.name,
+                    source_label=uploaded_file.name,
+                    input_type="log",
+                    record_index=1,
+                    energy_value=energy_value,
+                    energy_type=log_energy_type_label,
+                    energy_unit="Hartree",
+                    energy_source=log_energy_type_label,
+                    normal_termination=normal_term,
+                )
+                loaded_mols.append(mol)
 
-if result_df is not None:
-    if st.session_state["atom_mappings"]:
-        eq_df = average_equivalent_atoms(result_df, st.session_state["atom_mappings"])
-        st.subheader(t("eq_avg_header"))
-        st.dataframe(eq_df, use_container_width=True)
+            elif suffix == ".sdf":
+                input_types_seen.add("sdf")
 
-    st.subheader(t("download_header"))
+                mols_in_sdf = read_all_mols_from_sdf(file_path)
+                if not mols_in_sdf:
+                    processing_logs.append({
+                        "source_label": uploaded_file.name,
+                        "source_file": uploaded_file.name,
+                        "input_type": "sdf",
+                        "record_index": "",
+                        "energy_type": "SDF",
+                        "energy_property": sdf_manual_property_name if sdf_energy_mode == "manual" else "",
+                        "energy_unit": sdf_energy_unit,
+                        "energy_value": None,
+                        "relative_energy_kcal_mol": None,
+                        "rank_by_energy": None,
+                        "status": "rdkit_read_failed",
+                        "duplicate_of": "",
+                        "rmsd_to_representative": None,
+                        "normal_termination": "",
+                    })
+                    progress.progress(i / total_files)
+                    continue
 
-    if per_conf_df is not None:
-        st.download_button(
-            label=t("download_per_conf"),
-            data=dataframe_to_csv_bytes(per_conf_df),
-            file_name=f"{output_prefix}_per_conformer_isotropic_shieldings.csv",
-            mime="text/csv",
+                for idx, mol in enumerate(mols_in_sdf, start=1):
+                    energy_value, prop_name, extract_status = extract_energy_from_sdf_mol(
+                        mol,
+                        mode=sdf_energy_mode,
+                        manual_property_name=sdf_manual_property_name,
+                    )
+
+                    source_label = f"{uploaded_file.name} [record {idx}]"
+
+                    annotate_mol(
+                        mol=mol,
+                        source_file=uploaded_file.name,
+                        source_label=source_label,
+                        input_type="sdf",
+                        record_index=idx,
+                        energy_value=energy_value,
+                        energy_type="SDF",
+                        energy_unit=sdf_energy_unit,
+                        energy_source=prop_name or (sdf_manual_property_name if sdf_energy_mode == "manual" else ""),
+                        normal_termination="",
+                    )
+                    loaded_mols.append(mol)
+
+                    if extract_status == "manual_property_not_found":
+                        processing_logs.append({
+                            "source_label": source_label,
+                            "source_file": uploaded_file.name,
+                            "input_type": "sdf",
+                            "record_index": idx,
+                            "energy_type": "SDF",
+                            "energy_property": sdf_manual_property_name,
+                            "energy_unit": sdf_energy_unit,
+                            "energy_value": None,
+                            "relative_energy_kcal_mol": None,
+                            "rank_by_energy": None,
+                            "status": "manual_property_not_found",
+                            "duplicate_of": "",
+                            "rmsd_to_representative": None,
+                            "normal_termination": "",
+                        })
+
+            else:
+                processing_logs.append({
+                    "source_label": uploaded_file.name,
+                    "source_file": uploaded_file.name,
+                    "input_type": "",
+                    "record_index": "",
+                    "energy_type": "",
+                    "energy_property": "",
+                    "energy_unit": "",
+                    "energy_value": None,
+                    "relative_energy_kcal_mol": None,
+                    "rank_by_energy": None,
+                    "status": "unsupported_file_type",
+                    "duplicate_of": "",
+                    "rmsd_to_representative": None,
+                    "normal_termination": "",
+                })
+
+            progress.progress(i / total_files)
+
+        status_box.write(texts["conversion_finished"])
+
+        if not loaded_mols:
+            st.error(texts["no_valid_molecules"])
+            if processing_logs:
+                st.dataframe(make_display_df(pd.DataFrame(processing_logs), lang, texts), use_container_width=True)
+            st.stop()
+
+        all_sdf_bytes = write_sdf_bytes(loaded_mols)
+
+        kept_mols, summary_rows = deduplicate_molecules(
+            mols=loaded_mols,
+            rmsd_cutoff=rmsd_cutoff,
+            remove_hs_for_rmsd=remove_hs_for_rmsd,
+            rmsd_method=rmsd_method,
         )
 
-    st.download_button(
-        label=t("download_avg"),
-        data=dataframe_to_csv_bytes(result_df),
-        file_name=f"{output_prefix}_boltzmann_averaged_nmr.csv",
-        mime="text/csv",
-    )
+        unique_sdf_bytes = write_sdf_bytes(kept_mols)
 
-    if valid_df is not None:
-        st.download_button(
-            label=t("download_weights"),
-            data=dataframe_to_csv_bytes(valid_df),
-            file_name=f"{output_prefix}_boltzmann_weights.csv",
-            mime="text/csv",
-        )
+        summary_rows.extend(processing_logs)
 
-    if eq_df is not None:
-        st.download_button(
-            label=t("download_eq"),
-            data=dataframe_to_csv_bytes(eq_df),
-            file_name=f"{output_prefix}_equivalent_atom_averaged_nmr.csv",
-            mime="text/csv",
-        )
+        summary_df, summary_csv_bytes = make_summary_csv_bytes(summary_rows)
+        if not summary_df.empty:
+            summary_df = summary_df.sort_values(
+                by=["status", "rank_by_energy", "source_label"],
+                na_position="last"
+            ).reset_index(drop=True)
+
+        processing_logs_df = pd.DataFrame(processing_logs) if processing_logs else pd.DataFrame()
+
+        st.session_state.result_payload = {
+            "uploaded_count": len(uploaded_files),
+            "loaded_count": len(loaded_mols),
+            "kept_count": len(kept_mols),
+            "summary_df": summary_df,
+            "all_sdf_bytes": all_sdf_bytes,
+            "unique_sdf_bytes": unique_sdf_bytes,
+            "summary_csv_bytes": summary_csv_bytes,
+            "processing_logs_df": processing_logs_df,
+            "mixed_input_types": len(input_types_seen) > 1,
+            "output_prefix": output_prefix,
+        }
+        st.session_state.results_ready = True
+
+# render from session state
+if st.session_state.results_ready and st.session_state.result_payload is not None:
+    render_results(st.session_state.result_payload, lang, texts)
